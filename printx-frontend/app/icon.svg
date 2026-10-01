@@ -1,0 +1,26 @@
+<svg width="32" height="32" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Outer diamond frame -->
+  <path d="M32 4 L60 32 L32 60 L4 32 Z" fill="none" stroke="#FF3B30" stroke-width="3" stroke-linejoin="round"/>
+  
+  <!-- Inner diamond -->
+  <path d="M32 14 L50 32 L32 50 L14 32 Z" fill="#FF3B30" fill-opacity="0.2" stroke="#FF3B30" stroke-width="2.5" stroke-linejoin="round"/>
+  
+  <!-- Central X cross -->
+  <line x1="16" y1="16" x2="48" y2="48" stroke="#FF3B30" stroke-width="5" stroke-linecap="round"/>
+  <line x1="48" y1="16" x2="16" y2="48" stroke="#FF3B30" stroke-width="5" stroke-linecap="round"/>
+  
+  <!-- Top chevron -->
+  <path d="M22 10 L32 4 L42 10" fill="none" stroke="#FF3B30" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+  
+  <!-- Bottom chevron -->
+  <path d="M22 54 L32 60 L42 54" fill="none" stroke="#FF3B30" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+  
+  <!-- Left chevron -->
+  <path d="M10 22 L4 32 L10 42" fill="none" stroke="#FF3B30" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+  
+  <!-- Right chevron -->
+  <path d="M54 22 L60 32 L54 42" fill="none" stroke="#FF3B30" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+  
+  <!-- Center dot -->
+  <circle cx="32" cy="32" r="3.5" fill="#FF3B30"/>
+</svg>

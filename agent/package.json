@@ -1,0 +1,21 @@
+{
+  "name": "printx-print-agent",
+  "version": "2.0.0",
+  "private": true,
+  "description": "PrintX desktop print agent — Supabase Realtime-driven silent PDF spooler with offline catch-up polling and a 30s shop heartbeat (Printer Status 🟢 Online).",
+  "main": "print_agent.js",
+  "scripts": {
+    "start": "node print_agent.js",
+    "once": "node print_agent.js --once",
+    "dry": "node print_agent.js --dry-run"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.0",
+    "axios": "^1.7.9",
+    "dotenv": "^16.4.7",
+    "pdf-to-printer": "^5.5.0"
+  }
+}

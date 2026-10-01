@@ -1,0 +1,8 @@
+node_modules/
+.env
+.env.local
+local_queue.db
+local_queue.db-wal
+local_queue.db-shm
+downloads/
+temp/

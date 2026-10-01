@@ -1,0 +1,45 @@
+# ---- Secrets / environment ----
+.env
+.env.local
+.env.*.local
+**/.env
+**/.env.local
+!.env.example
+
+# ---- Dependencies ----
+node_modules/
+**/node_modules/
+
+# ---- Build output ----
+.next/
+out/
+dist/
+build/
+
+# ---- Logs (Freebuff previews, backend, agent) ----
+.freebuff/
+logs/
+*.log
+*.log.err
+npm-debug.log*
+
+# ---- Print agent runtime data ----
+agent/temp/
+agent/downloads/
+agent/local_queue.db*
+
+# ---- Uploads (customer PDFs) ----
+uploads/
+printx-frontend/uploads/
+
+# ---- WhatsApp session data ----
+whatsapp-sessions/
+printx-frontend/whatsapp-sessions/
+
+# ---- Stray files with broken names from tooling ----
+C:Users*
+
+# ---- OS / editor ----
+Thumbs.db
+Desktop.ini
+.DS_Store

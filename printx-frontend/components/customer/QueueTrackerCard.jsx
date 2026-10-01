@@ -1,0 +1,377 @@
+'use client';
+
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
+import {
+  Users,
+  Clock,
+  Printer,
+  CheckCircle2,
+  Loader2,
+  Radio,
+  Hourglass,
+} from 'lucide-react';
+import { supabase, isSupabaseConfigured } from '../../lib/supabaseClient';
+
+/**
+ * QueueTrackerCard — live queue position + ETA for the customer token screen.
+ *
+ * Live mode (Supabase configured):
+ *   - Fetches /api/jobs/queue-status on mount for the initial position.
+ *   - Subscribes to Supabase postgres_changes on `print_jobs` filtered by
+ *     shop_id — every INSERT/UPDATE re-polls the endpoint so position and
+ *     ETA recalculate instantly without a page refresh.
+ *
+ * Demo mode (no Supabase):
+ *   - Simulates a live queue: position ticks down every ~8 seconds and the
+ *     status walks PENDING → PRINTING → COMPLETED so the full UX is visible.
+ *   - A short beep fires when the job reaches READY (Web Audio API).
+ */
+
+const POLL_INTERVAL_MS = 15000; // fallback poll when no realtime event fires
+
+export default function QueueTrackerCard({
+  jobId,
+  tokenNumber,
+  shopId = 'demo-shop',
+  demo = false,
+}) {
+  const [state, setState] = useState({
+    loading: true,
+    queuePosition: null,
+    totalInQueue: null,
+    estimatedMinutes: null,
+    jobStatus: 'PENDING',
+    live: false,
+    demo: false,
+  });
+  const [beeped, setBeeped] = useState(false);
+  const audioCtxRef = useRef(null);
+  const channelRef = useRef(null);
+
+  /* ------------------------- Beep on ready ------------------------- */
+  const beep = useCallback(() => {
+    if (beeped) return;
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      if (!audioCtxRef.current || audioCtxRef.current.state === 'closed') {
+        audioCtxRef.current = new Ctx();
+      }
+      const ctx = audioCtxRef.current;
+      if (ctx.state === 'suspended') ctx.resume();
+      // Bright three-note "ready" chime
+      const now = ctx.currentTime;
+      [[660, 0], [880, 0.14], [1100, 0.28]].forEach(([freq, offset]) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'sine';
+        osc.frequency.value = freq;
+        gain.gain.setValueAtTime(0.0001, now + offset);
+        gain.gain.exponentialRampToValueAtTime(0.3, now + offset + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + offset + 0.25);
+        osc.connect(gain).connect(ctx.destination);
+        osc.start(now + offset);
+        osc.stop(now + offset + 0.3);
+      });
+      setBeeped(true);
+    } catch {
+      /* audio unavailable — never block the UI */
+    }
+  }, [beeped]);
+
+  /* ------------------------- Fetch queue status ------------------------- */
+  const fetchStatus = useCallback(async () => {
+    try {
+      const params = new URLSearchParams();
+      if (jobId) params.set('jobId', jobId);
+      if (tokenNumber) params.set('token', tokenNumber);
+      if (shopId) params.set('shopId', shopId);
+
+      const res = await fetch(`/api/jobs/queue-status?${params.toString()}`);
+      const data = await res.json();
+      if (!res.ok || !data.success) return;
+
+      setState((prev) => ({
+        ...prev,
+        loading: false,
+        queuePosition: data.queuePosition,
+        totalInQueue: data.totalInQueue ?? data.queuePosition,
+        estimatedMinutes: data.estimatedMinutes,
+        jobStatus: data.jobStatus || prev.jobStatus,
+        demo: Boolean(data.demo),
+      }));
+    } catch {
+      /* network hiccup — keep last known state */
+    }
+  }, [jobId, tokenNumber, shopId]);
+
+  /* ------------------------- Initial fetch ------------------------- */
+  useEffect(() => {
+    fetchStatus();
+  }, [fetchStatus]);
+
+  /* ------------------------- Realtime subscription ------------------------- */
+  useEffect(() => {
+    if (!isSupabaseConfigured || !supabase || demo) {
+      // Demo simulation: walk the job through its lifecycle
+      if (!demo) return;
+      let pos = 3;
+      let status = 'PENDING';
+      const timer = setInterval(() => {
+        if (status === 'PENDING') {
+          pos -= 1;
+          if (pos <= 1) {
+            status = 'PRINTING';
+          }
+        } else if (status === 'PRINTING') {
+          status = 'COMPLETED';
+        }
+        setState((prev) => ({
+          ...prev,
+          loading: false,
+          queuePosition: Math.max(1, pos),
+          totalInQueue: Math.max(1, pos),
+          estimatedMinutes: status === 'COMPLETED' ? 0 : Math.max(0, Math.round((pos - 1) * 1.5 * 10) / 10),
+          jobStatus: status,
+          demo: true,
+        }));
+        if (status === 'COMPLETED') beep();
+      }, 8000);
+      return () => clearInterval(timer);
+    }
+
+    // Live mode — subscribe to any change on this shop's print_jobs
+    const channel = supabase
+      .channel(`queue-tracker-${shopId}`)
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'print_jobs',
+          filter: `shop_id=eq.${shopId}`,
+        },
+        () => {
+          // Any insert/update/deletion on the shop queue → recalculate
+          fetchStatus();
+        }
+      )
+      .subscribe((status) => {
+        setState((prev) => ({ ...prev, live: status === 'SUBSCRIBED' }));
+      });
+
+    channelRef.current = channel;
+
+    // Fallback poll in case realtime events are missed
+    const poll = setInterval(fetchStatus, POLL_INTERVAL_MS);
+
+    return () => {
+      try {
+        supabase.removeChannel(channel);
+      } catch { /* noop */ }
+      clearInterval(poll);
+    };
+  }, [shopId, demo, fetchStatus, beep]);
+
+  /* ------------------------- Beep when ready ------------------------- */
+  useEffect(() => {
+    if (state.jobStatus === 'COMPLETED') beep();
+  }, [state.jobStatus, beep]);
+
+  const { loading, queuePosition, estimatedMinutes, jobStatus, live, demo: isDemo } = state;
+  // Orders ahead of this customer (position includes the customer's own job).
+  const ordersAhead = Math.max(0, (queuePosition || 1) - 1);
+
+  /* ------------------------- Status pill config ------------------------- */
+  const statusConfig = {
+    PENDING: {
+      label: 'Waiting in Queue...',
+      cls: 'bg-amber-500/15 text-amber-400 border-amber-500/30',
+      icon: Hourglass,
+      pulse: false,
+    },
+    PRINTING: {
+      label: 'Printing Now! 🖨️',
+      cls: 'bg-[#06B6D4]/15 text-[#06B6D4] border-[#06B6D4]/30 shadow-[0_0_18px_rgba(6,182,212,0.35)]',
+      icon: Printer,
+      pulse: true,
+    },
+    COMPLETED: {
+      label: 'Ready for Pickup! 🎉',
+      cls: 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30 shadow-[0_0_18px_rgba(16,185,129,0.35)]',
+      icon: CheckCircle2,
+      pulse: false,
+    },
+  };
+  const cfg = statusConfig[jobStatus] || statusConfig.PENDING;
+  const isReady = jobStatus === 'COMPLETED';
+
+  if (loading) {
+    return (
+      <div className="rounded-2xl border border-[#1E2D4A] bg-[#1E293B] p-5 flex items-center justify-center text-sm text-slate-400">
+        <Loader2 className="w-4 h-4 animate-spin mr-2" />
+        Checking your position in the queue…
+      </div>
+    );
+  }
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 10 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ delay: 0.2 }}
+      className="relative overflow-hidden rounded-2xl border border-[#1E2D4A] bg-[#1E293B] p-5"
+    >
+      {/* Decorative glow that changes with status */}
+      <div
+        aria-hidden="true"
+        className={`absolute -top-10 -right-10 w-32 h-32 rounded-full blur-3xl transition-colors duration-700 ${
+          isReady ? 'bg-emerald-500/20' : jobStatus === 'PRINTING' ? 'bg-cyan-500/20' : 'bg-amber-500/15'
+        }`}
+      />
+
+      <div className="relative">
+        {/* Header row */}
+        <div className="flex items-center justify-between mb-4">
+          <div className="flex items-center gap-2 text-[11px] font-bold uppercase tracking-widest text-slate-400">
+            <Radio className="w-3.5 h-3.5 text-cyan-400" />
+            Live Queue Tracker
+          </div>
+          <span
+            className={`inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-full border ${
+              isDemo
+                ? 'bg-slate-800 text-slate-400 border-slate-700'
+                : live
+                  ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30'
+                  : 'bg-amber-500/15 text-amber-400 border-amber-500/30'
+            }`}
+          >
+            <span className={`relative flex h-1.5 w-1.5 ${live && !isDemo ? '' : ''}`}>
+              {live && !isDemo && (
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+              )}
+              <span
+                className={`relative inline-flex rounded-full h-1.5 w-1.5 ${
+                  isDemo ? 'bg-slate-500' : live ? 'bg-emerald-500' : 'bg-amber-500'
+                }`}
+              />
+            </span>
+            {isDemo ? 'Simulated' : live ? 'Live' : 'Polling'}
+          </span>
+        </div>
+
+        {/* Main grid: position + ETA */}
+        <div className="grid grid-cols-2 gap-3">
+          {/* Queue position */}
+          <div className="rounded-xl bg-[#0B132B] border border-[#1E2D4A] p-4 text-center">
+            <Users className="w-4 h-4 mx-auto mb-1.5 text-cyan-400" />
+            <div className="text-[10px] font-bold uppercase tracking-wide text-slate-500 mb-1">
+              Your Position
+            </div>
+            <AnimatePresence mode="popLayout">
+              <motion.div
+                key={queuePosition}
+                initial={{ scale: 0.6, opacity: 0 }}
+                animate={{ scale: 1, opacity: 1 }}
+                exit={{ scale: 0.6, opacity: 0 }}
+                transition={{ type: 'spring', stiffness: 400, damping: 22 }}
+                className="text-3xl font-black text-white tracking-tight"
+              >
+                {isReady ? '—' : `#${queuePosition}`}
+              </motion.div>
+            </AnimatePresence>
+            <div className="text-[10px] text-slate-500 mt-0.5">
+              {isReady ? 'Printed' : queuePosition === 1 ? 'Next up!' : `in line`}
+            </div>
+          </div>
+
+          {/* ETA */}
+          <div className="rounded-xl bg-[#0B132B] border border-[#1E2D4A] p-4 text-center">
+            <Clock className="w-4 h-4 mx-auto mb-1.5 text-amber-400" />
+            <div className="text-[10px] font-bold uppercase tracking-wide text-slate-500 mb-1">
+              Est. Ready In
+            </div>
+            <AnimatePresence mode="popLayout">
+              <motion.div
+                key={estimatedMinutes}
+                initial={{ scale: 0.6, opacity: 0 }}
+                animate={{ scale: 1, opacity: 1 }}
+                exit={{ scale: 0.6, opacity: 0 }}
+                transition={{ type: 'spring', stiffness: 400, damping: 22 }}
+                className="text-3xl font-black text-white tracking-tight"
+              >
+                {isReady ? '✓' : `~${estimatedMinutes}`}
+              </motion.div>
+            </AnimatePresence>
+            <div className="text-[10px] text-slate-500 mt-0.5">
+              {isReady ? 'Done' : 'mins'}
+            </div>
+          </div>
+        </div>
+
+        {/* Spec estimator — X orders ahead (~ Y mins at 1.5 min/order) */}
+        <div className="mt-3 text-center text-[11px] font-semibold text-slate-400">
+          Queue Status:{' '}
+          <span className="text-white font-bold">{isReady ? 0 : ordersAhead}</span>{' '}
+          order{(isReady ? 0 : ordersAhead) === 1 ? '' : 's'} ahead of you (~ Estimated Wait Time:{' '}
+          <span className="text-amber-300 font-bold">{isReady ? 0 : estimatedMinutes}</span> mins)
+        </div>
+
+        {/* Status pill */}
+        <div className="mt-4 flex justify-center">
+          <motion.span
+            animate={cfg.pulse && !isReady ? { scale: [1, 1.04, 1] } : {}}
+            transition={{ repeat: cfg.pulse && !isReady ? Infinity : 0, duration: 1.6 }}
+            className={`inline-flex items-center gap-2 px-4 py-2 rounded-full border text-sm font-bold ${cfg.cls}`}
+          >
+            <cfg.icon className="w-4 h-4" />
+            {cfg.label}
+          </motion.span>
+        </div>
+
+        {/* Progress steps */}
+        <div className="mt-4 flex items-center gap-1.5">
+          {[
+            { id: 'PENDING', label: 'Queued' },
+            { id: 'PRINTING', label: 'Printing' },
+            { id: 'COMPLETED', label: 'Ready' },
+          ].map((step, idx) => {
+            const stepOrder = ['PENDING', 'PRINTING', 'COMPLETED'];
+            const currentIdx = stepOrder.indexOf(jobStatus);
+            const done = idx <= currentIdx;
+            return (
+              <React.Fragment key={step.id}>
+                {idx > 0 && (
+                  <div
+                    className={`flex-1 h-0.5 rounded-full transition-colors duration-500 ${
+                      idx <= currentIdx ? 'bg-cyan-500/60' : 'bg-slate-700'
+                    }`}
+                  />
+                )}
+                <div className="flex flex-col items-center gap-1">
+                  <div
+                    className={`w-2.5 h-2.5 rounded-full transition-colors duration-500 ${
+                      done
+                        ? idx === currentIdx
+                          ? 'bg-cyan-400 shadow-[0_0_8px_rgba(6,182,212,0.6)]'
+                          : 'bg-emerald-500'
+                        : 'bg-slate-700'
+                    }`}
+                  />
+                  <span
+                    className={`text-[9px] font-semibold ${
+                      done ? 'text-slate-300' : 'text-slate-600'
+                    }`}
+                  >
+                    {step.label}
+                  </span>
+                </div>
+              </React.Fragment>
+            );
+          })}
+        </div>
+      </div>
+    </motion.div>
+  );
+}
