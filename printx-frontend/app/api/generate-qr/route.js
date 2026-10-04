@@ -10,11 +10,17 @@ import { supabaseAdmin } from '../../../lib/supabaseAdmin';
  *   type=pdf → A4 poster (jsPDF vector layout + embedded QR image), print-ready
  *   type=png → high-res 1024px square QR sticker with shop name band
  *
+ * `slug` is the canonical query key; `shopSlug` is accepted as an alias for
+ * backward compatibility with older links/clients.
+ *
+ * Errors: 400 when the slug is missing/malformed, 404 when no shop matches
+ * the slug in the live `shops` table, 400 for an invalid `type`.
+ *
  * Demo mode (no Supabase): falls back to a slug-derived shop name so the
  * generator works locally before the Supabase project exists.
  */
 
-const BASE_URL = process.env.NEXT_PUBLIC_QRKRAFT_BASE_URL || 'https://qrkraft.in';
+const BASE_URL = process.env.NEXT_PUBLIC_APP_URL || 'https://printx.qrkraft.in';
 const DOWNLOAD_NAME_MAX = 60;
 
 // Demo shop directory — mirrors the customer page's SHOPS map
@@ -26,10 +32,13 @@ const DEMO_SHOPS = {
 export async function GET(request) {
   try {
     const { searchParams } = new URL(request.url);
-    const slug = (searchParams.get('slug') || '').trim();
+    // `shopSlug` is an accepted alias so older links keep working.
+    const slug = (searchParams.get('slug') || searchParams.get('shopSlug') || '').trim();
     const type = (searchParams.get('type') || 'pdf').toLowerCase();
 
-    if (!slug || !/^[a-z0-9-]{2,60}$/.test(slug)) {
+    // Signup's slugify() generates underscore slugs (e.g. rohit_printing) and
+    // the admin API allows both "_" and "-", so both must be accepted here.
+    if (!slug || !/^[a-z0-9_-]{2,60}$/.test(slug)) {
       return NextResponse.json({ success: false, error: 'Valid shop slug is required' }, { status: 400 });
     }
     if (!['pdf', 'png'].includes(type)) {
@@ -45,8 +54,18 @@ export async function GET(request) {
         .eq('slug', slug)
         .single();
       if (!error && data) shop = data;
+      // Known demo slugs stay resolvable even without a seeded DB row.
+      if (!shop) shop = DEMO_SHOPS[slug] || null;
+      if (!shop) {
+        return NextResponse.json(
+          { success: false, error: `Shop not found for slug "${slug}"` },
+          { status: 404 }
+        );
+      }
+    } else {
+      // Demo mode (no Supabase): derive a shop so the generator works locally.
+      shop = DEMO_SHOPS[slug] || { name: titleize(slug), slug };
     }
-    if (!shop) shop = DEMO_SHOPS[slug] || { name: titleize(slug), slug };
 
     const uploadUrl = `${BASE_URL}/s/${slug}`;
 

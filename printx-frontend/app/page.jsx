@@ -610,7 +610,7 @@ export default function LandingPage() {
               desc="A sticker at the counter opens your shop's upload page — no app install, works on any phone camera."
               visual={
                 <div className="mx-auto w-24 h-24 rounded-xl bg-white p-2">
-                  <QRCodeSVG value="https://printx.in/s/sharma_xerox" size={88} fgColor="#0B132B" />
+                  <QRCodeSVG value={`${process.env.NEXT_PUBLIC_APP_URL || 'https://printx.qrkraft.in'}/s/sharma_xerox`} size={88} fgColor="#0B132B" />
                 </div>
               }
             />

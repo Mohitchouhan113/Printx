@@ -52,6 +52,8 @@ async function insertShopWithFallback(payload) {
       (msg.match(/column .*\.([a-zA-Z_]+) does not exist/) || [])[1] ||
       (msg.includes('PGRST204') ? (msg.match(/'([a-zA-Z_]+)'/) || [])[1] : null);
     if (!col || !(col in attempt) || col === 'owner_id') return { data: null, error };
+    // Schema gaps must be loud, never silent data loss (mirrors ShopSettings).
+    console.warn(`[signup] shops schema missing column "${col}" — dropping it and retrying insert`);
     delete attempt[col]; // schema-tolerant: drop the unknown column, retry
   }
   return { data: null, error: new Error('Shop insert failed after schema fallback.') };

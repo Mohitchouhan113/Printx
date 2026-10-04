@@ -57,7 +57,7 @@ const WhatsAppQrModal = dynamic(() => import('./WhatsAppQrModal'), { ssr: false 
  *   /api/generate-qr?slug=…&type=png  → 1024px sticker PNG
  */
 
-const QR_BASE_URL = process.env.NEXT_PUBLIC_QRKRAFT_BASE_URL || 'https://qrkraft.in';
+const QR_BASE_URL = process.env.NEXT_PUBLIC_APP_URL || 'https://printx.qrkraft.in';
 
 const DEFAULT_FORM = {
   name: '',
