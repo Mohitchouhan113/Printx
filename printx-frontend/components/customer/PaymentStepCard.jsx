@@ -79,7 +79,7 @@ export default function PaymentStepCard({
           description: `Print order · ${fileCount} file(s) · ${pageCount} pages`,
         }),
       });
-      order = await res.json();
+      order = await res.json().catch(() => ({}));
       if (!res.ok || !order.success) throw new Error(order.error || 'Could not start payment');
     } catch (err) {
       setPhase(null);

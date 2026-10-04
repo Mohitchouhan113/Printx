@@ -533,7 +533,7 @@ export default function ShopUploadPage({ params }) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ code, shopSlug: slug }),
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (res.ok && data.success) {
         setCoupon(data.coupon);
         setCouponStatus({ type: 'success', message: `${data.coupon.code} applied!` });

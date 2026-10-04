@@ -49,7 +49,7 @@ export async function startCheckout({ planId, billingCycle, shopId, shopSlug, sh
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ planId, billingCycle, shopId, shopSlug }),
     });
-    order = await res.json();
+    order = await res.json().catch(() => ({}));
     if (!res.ok || !order.success) {
       throw new Error(order.error || 'Could not start payment');
     }
@@ -76,7 +76,7 @@ export async function startCheckout({ planId, billingCycle, shopId, shopSlug, sh
           amountRupees: order.amount / 100,
         }),
       });
-      const verified = await res.json();
+      const verified = await res.json().catch(() => ({}));
       if (!res.ok || !verified.success) throw new Error(verified.error || 'Verification failed');
       return { ok: true, demo: true, planId, planLabel: verified.planLabel, expiresAt: verified.expiresAt };
     } catch (err) {
@@ -121,7 +121,7 @@ export async function startCheckout({ planId, billingCycle, shopId, shopSlug, sh
               amountRupees: order.amount / 100,
             }),
           });
-          const verified = await res.json();
+          const verified = await res.json().catch(() => ({}));
           if (!res.ok || !verified.success) throw new Error(verified.error || 'Verification failed');
           resolve({ ok: true, planId, planLabel: verified.planLabel, expiresAt: verified.expiresAt });
         } catch (err) {

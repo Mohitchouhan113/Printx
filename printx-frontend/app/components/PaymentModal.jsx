@@ -131,7 +131,7 @@ export default function PaymentModal({
         throw new Error(body.message || `HTTP ${res.status}`);
       }
 
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (!data?.data) throw new Error('No order data returned');
 
       const createdOrder = data.data;
