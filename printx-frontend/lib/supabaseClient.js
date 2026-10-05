@@ -45,4 +45,4 @@ export const supabase = isSupabaseConfigured
   ? createClient(url, anonKey, { global: { fetch: supabaseFetch } })
   : null;
 
-export const SUPABASE_BUCKET = 'print-uploads';
+export const SUPABASE_BUCKET = 'print-files';

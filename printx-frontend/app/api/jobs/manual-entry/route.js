@@ -29,7 +29,9 @@ import { priorityWrite, PRIORITY_FEE } from '../../../../lib/priority';
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY =
   process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-const BUCKET = 'print-uploads';
+// Preferred storage bucket first; the legacy name stays as a fallback so
+// walk-in files land in the same bucket as online orders (/api/upload).
+const BUCKETS = ['print-files', 'print-uploads'];
 
 const supabaseAdmin =
   SUPABASE_URL && SUPABASE_SERVICE_KEY ? createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY) : null;
@@ -154,19 +156,35 @@ export async function POST(request) {
       const safeName = (file.name || 'walkin-doc').replace(/[^\w.\-() ]/g, '_').slice(-120);
       const storagePath = `${shop.id}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${safeName}`;
 
-      const { error: uploadErr } = await supabaseAdmin.storage
-        .from(BUCKET)
-        .upload(storagePath, file, {
-          contentType: file.type,
-          upsert: false,
-        });
+      // Try 'print-files' first (legacy 'print-uploads' fallback) and
+      // self-heal a missing bucket — a Storage problem never blocks the
+      // job: fileUrl simply stays null when every bucket fails.
+      let storedBucket = null;
+      for (const bucket of BUCKETS) {
+        const { error: uploadErr } = await supabaseAdmin.storage
+          .from(bucket)
+          .upload(storagePath, file, { contentType: file.type, upsert: false });
+        if (!uploadErr) { storedBucket = bucket; break; }
+        if (/bucket not found|nosuchbucket/i.test(uploadErr.message || '')) {
+          const { error: createErr } = await supabaseAdmin.storage.createBucket(bucket, {
+            public: true,
+            fileSizeLimit: 20 * 1024 * 1024,
+          });
+          if (!createErr || /already exists|duplicate/i.test(createErr.message || '')) {
+            const retry = await supabaseAdmin.storage
+              .from(bucket)
+              .upload(storagePath, file, { contentType: file.type, upsert: false });
+            if (!retry.error) { storedBucket = bucket; break; }
+          }
+        }
+      }
 
-      if (!uploadErr) {
+      if (storedBucket) {
         // Permanent public URL first (auto-print + downloads must never hit
         // an expired link); signed URL only as fallback for private buckets.
-        const publicUrl = supabaseAdmin.storage.from(BUCKET).getPublicUrl(storagePath).data?.publicUrl;
+        const publicUrl = supabaseAdmin.storage.from(storedBucket).getPublicUrl(storagePath).data?.publicUrl;
         const { data: signed } = await supabaseAdmin.storage
-          .from(BUCKET)
+          .from(storedBucket)
           .createSignedUrl(storagePath, 60 * 60 * 24 * 7);
         fileUrl =
           (publicUrl && /^https?:\/\//.test(publicUrl) ? publicUrl : null) ||

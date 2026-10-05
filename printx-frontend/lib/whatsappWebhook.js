@@ -31,7 +31,9 @@ export const BINDINGS_KEY = 'whatsapp_bindings'; // { phone_number_id: shopSlug 
 /** Pending documents expire after 6 hours (media + quote are short-lived). */
 export const PENDING_TTL_MS = 6 * 60 * 60 * 1000;
 
-const BUCKET = 'print-uploads';
+// Preferred storage bucket first; legacy name kept as fallback so inbound
+// WhatsApp documents land in the same bucket as online orders.
+const BUCKETS = ['print-files', 'print-uploads'];
 
 /* ================================================================== */
 /* 1. Webhook verification (GET)                                       */
@@ -390,11 +392,27 @@ export async function processDocumentMessage({ message, shop, supabase, fetchMed
     /* ---- 4. Persist file to Supabase Storage (WhatsApp URLs expire) ---- */
     const safeName = (message.document.filename || 'whatsapp-doc.pdf').replace(/[^\w.\-() ]/g, '_').slice(-100);
     const storagePath = `whatsapp/${shop.id}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${safeName}`;
-    const { error: upErr } = await supabase.storage
-      .from(BUCKET)
-      .upload(storagePath, buffer, { contentType: 'application/pdf', upsert: false });
-    if (upErr) throw new Error(`storage upload: ${upErr.message}`);
-    const publicUrl = supabase.storage.from(BUCKET).getPublicUrl(storagePath).data?.publicUrl;
+    let storedBucket = null;
+    let upErr = null;
+    for (const bucket of BUCKETS) {
+      const res = await supabase.storage
+        .from(bucket)
+        .upload(storagePath, buffer, { contentType: 'application/pdf', upsert: false });
+      if (!res.error) { storedBucket = bucket; break; }
+      upErr = res.error;
+      // Missing bucket → create it (public) and retry this upload once.
+      if (/bucket not found|nosuchbucket/i.test(upErr.message || '')) {
+        const { error: createErr } = await supabase.storage.createBucket(bucket, { public: true });
+        if (!createErr || /already exists|duplicate/i.test(createErr.message || '')) {
+          const retry = await supabase.storage
+            .from(bucket)
+            .upload(storagePath, buffer, { contentType: 'application/pdf', upsert: false });
+          if (!retry.error) { storedBucket = bucket; upErr = null; break; }
+        }
+      }
+    }
+    if (upErr || !storedBucket) throw new Error(`storage upload: ${upErr?.message || 'no storage bucket available'}`);
+    const publicUrl = supabase.storage.from(storedBucket).getPublicUrl(storagePath).data?.publicUrl;
     if (!publicUrl) throw new Error('no public url for uploaded document');
 
     /* ---- 5. Save pending entry (awaiting payment confirmation) ---- */
