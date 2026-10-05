@@ -92,21 +92,26 @@ export async function POST(request) {
         .eq('id', resolvedShopId)
         .single();
 
-      if (shop?.whatsapp_notifications_enabled !== false && shop?.name) {
-        const bwRate = shop.bw_rate || 2;
-        const colorRate = shop.color_rate || 10;
-        const price = calculatePrice(job.page_count, job.config || {}, bwRate, colorRate);
+      // Non-blocking: status updates must succeed even if WhatsApp fails.
+      try {
+        if (shop?.whatsapp_notifications_enabled !== false && shop?.name) {
+          const bwRate = shop.bw_rate || 2;
+          const colorRate = shop.color_rate || 10;
+          const price = calculatePrice(job.page_count, job.config || {}, bwRate, colorRate);
 
-        const msg = buildCompletedMessage({
-          customerName: job.customer_name || 'Customer',
-          shopName: shop.name,
-          tokenNumber: job.token_number,
-          totalPrice: price.total,
-        });
+          const msg = buildCompletedMessage({
+            customerName: job.customer_name || 'Customer',
+            shopName: shop.name,
+            tokenNumber: job.token_number,
+            totalPrice: price.total,
+          });
 
-        sendWhatsAppFireAndForget({ to: job.customer_phone, message: msg });
-        whatsappSent = true;
-        console.log(`[update-status] WhatsApp pickup-ready sent for ${job.token_number}`);
+          sendWhatsAppFireAndForget({ to: job.customer_phone, message: msg });
+          whatsappSent = true;
+          console.log(`[update-status] WhatsApp pickup-ready sent for ${job.token_number}`);
+        }
+      } catch (waErr) {
+        console.error('[update-status] WhatsApp notification failed (non-fatal):', waErr?.message);
       }
     }
 

@@ -4,7 +4,9 @@
  * Uses @whiskeysockets/baileys to create a persistent WhatsApp Web session.
  * No Meta API costs — sends messages directly from a connected WhatsApp number.
  *
- * Session state is persisted to ./whatsapp-sessions/ so it survives restarts.
+ * Session state is persisted to the OS temp directory (os.tmpdir() +
+ * /whatsapp-sessions) so it works on read-only filesystems such as Vercel
+ * serverless functions, where only /tmp is writable.
  *
  * Usage:
  *   import { startGateway, getStatus, getQR, sendMessage } from './whatsapp-gateway';
@@ -19,6 +21,7 @@ import pino from 'pino';
 import { Boom } from '@hapi/boom';
 import path from 'path';
 import fs from 'fs';
+import os from 'os';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -28,12 +31,19 @@ const __dirname = path.dirname(__filename);
 /* SESSION CONFIGURATION                                               */
 /* ================================================================== */
 
-const SESSION_DIR = path.join(__dirname, '..', 'whatsapp-sessions');
+/* Session dir MUST live in a writable location: Vercel serverless functions
+ * have a read-only filesystem except /tmp, so a repo-local ./whatsapp-sessions
+ * path crashed every route importing this module with ENOENT/EROFS. */
+const SESSION_DIR =
+  process.env.WHATSAPP_SESSION_DIR || path.join(os.tmpdir(), 'whatsapp-sessions');
 const LOGGER = pino({ level: 'silent' });
 
-// Ensure session directory exists
-if (!fs.existsSync(SESSION_DIR)) {
+// Ensure session directory exists — never let a filesystem problem crash the
+// module at import time (it would 500 every route that imports this file).
+try {
   fs.mkdirSync(SESSION_DIR, { recursive: true });
+} catch (err) {
+  console.warn(`[wa-gateway] Could not create session dir "${SESSION_DIR}": ${err.message}`);
 }
 
 /* ================================================================== */

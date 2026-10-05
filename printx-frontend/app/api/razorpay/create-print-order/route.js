@@ -74,9 +74,14 @@ export async function POST(request) {
       keyId: RZP_KEY_ID,
     });
   } catch (err) {
+    // Always answer with JSON — never let a raw exception bubble up and
+    // render Next.js' HTML error page (breaks API clients on Vercel).
     console.error('[create-print-order] error:', err);
     return NextResponse.json(
-      { success: false, error: 'Could not create payment order' },
+      {
+        success: false,
+        error: `Could not create payment order${err?.message ? `: ${err.message}` : ''}`,
+      },
       { status: 500 }
     );
   }

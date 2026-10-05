@@ -632,8 +632,12 @@ export async function POST(request) {
       console.error('[upload] orders sidecar insert failed:', sidecarErr.message);
     }
 
-    /* --------------------- WhatsApp notification --------------------- */
-    if (customerPhone && shop?.name && shop?.whatsapp_notifications_enabled !== false) {
+    /* --------------------- WhatsApp notification ---------------------
+     * Non-blocking: any failure here must NEVER turn a successfully stored
+     * upload into a 500. Wrapped in its own try/catch as belt & braces on
+     * top of the fire-and-forget wrapper. */
+    try {
+      if (customerPhone && shop?.name && shop?.whatsapp_notifications_enabled !== false) {
       const bwRate = shop.bw_rate || 2;
       const colorRate = shop.color_rate || 10;
       // Calculate total price across all files
@@ -663,7 +667,10 @@ export async function POST(request) {
         colorPages: totalColor,
         totalPrice,
       });
-      sendWhatsAppFireAndForget({ to: customerPhone, message: msg });
+        sendWhatsAppFireAndForget({ to: customerPhone, message: msg });
+      }
+    } catch (waErr) {
+      console.error('[upload] WhatsApp notification failed (non-fatal):', waErr?.message);
     }
 
     return NextResponse.json({

@@ -318,18 +318,23 @@ export async function POST(request) {
       await bumpDailyRevenueAudit(supabaseAdmin, { amount: totalAmount, pages: totalPages });
     }
 
-    /* ---- WhatsApp notification ---- */
-    if (customerPhone && shop?.name && shop?.whatsapp_notifications_enabled !== false) {
-      const msg = buildWalkInMessage({
-        customerName,
-        shopName: shop.name,
-        tokenNumber,
-        totalPages,
-        bwPages,
-        colorPages,
-        totalAmount,
-      });
-      sendWhatsAppFireAndForget({ to: customerPhone, message: msg });
+    /* ---- WhatsApp notification ----
+     * Non-blocking: a WhatsApp failure must never fail a created order. */
+    try {
+      if (customerPhone && shop?.name && shop?.whatsapp_notifications_enabled !== false) {
+        const msg = buildWalkInMessage({
+          customerName,
+          shopName: shop.name,
+          tokenNumber,
+          totalPages,
+          bwPages,
+          colorPages,
+          totalAmount,
+        });
+        sendWhatsAppFireAndForget({ to: customerPhone, message: msg });
+      }
+    } catch (waErr) {
+      console.error('[manual-entry] WhatsApp notification failed (non-fatal):', waErr?.message);
     }
 
     return NextResponse.json({
