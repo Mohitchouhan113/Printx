@@ -12,8 +12,8 @@ import { createClient } from '@supabase/supabase-js';
  *   2. estimatedMinutes = orders ahead × 1.5 minutes (spec: average 1.5
  *      minutes per order). ordersAhead = queuePosition − 1.
  *
- * When Supabase is not configured (demo mode) the endpoint returns a
- * deterministic simulated response so the UI is fully explorable locally.
+ * When Supabase is not configured the endpoint returns `unavailable: true`
+ * rather than simulated queue data — status is never faked on the client.
  */
 
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
@@ -32,8 +32,9 @@ export async function GET(request) {
   try {
     const { searchParams } = new URL(request.url);
     const jobId = searchParams.get('jobId');
-    const shopId = searchParams.get('shopId');
-    const tokenNumber = searchParams.get('token'); // demo fallback identifier
+    let shopId = searchParams.get('shopId');
+    const shopSlug = searchParams.get('shopSlug');
+    const tokenNumber = searchParams.get('token');
 
     /* ------------------------- Validation ------------------------- */
     if (!jobId && !tokenNumber) {
@@ -43,34 +44,39 @@ export async function GET(request) {
       );
     }
 
-    /* --------------------- Demo mode (no Supabase) --------------------- */
+    /* --------------------- No database configured --------------------- */
     if (!supabaseAdmin) {
-      // Deterministic pseudo-random from token/jobId so the number is stable
-      // between polls but varies between different customers.
-      const seedSource = String(jobId || tokenNumber || 'demo');
-      let hash = 0;
-      for (let i = 0; i < seedSource.length; i++) {
-        hash = (hash * 31 + seedSource.charCodeAt(i)) % 997;
-      }
-      const position = (hash % 3) + 1; // 1..3
-      const aheadPages = (hash % 40) + 10; // 10..50 pages ahead
-      const ordersAhead = position - 1;
-      const etaMinutes = Math.round(ordersAhead * MINUTES_PER_ORDER * 10) / 10;
-
+      // STRICT MODE: never invent queue numbers or a job status. This used to
+      // hash the token into a fake position and report the order as PRINTING,
+      // which is indistinguishable from a real queue update on the customer's
+      // screen. Report the failure honestly instead.
+      console.warn('[queue-status] Supabase not configured — queue unavailable');
       return NextResponse.json({
         success: true,
-        demo: true,
-        queuePosition: position,
-        ordersAhead,
-        totalInQueue: position + (hash % 2),
-        aheadPages,
-        estimatedMinutes: etaMinutes,
-        jobStatus: position === 1 ? 'PRINTING' : 'PENDING',
+        unavailable: true,
+        queuePosition: null,
+        ordersAhead: null,
+        totalInQueue: null,
+        aheadPages: null,
+        estimatedMinutes: null,
+        jobStatus: null,
+        error: 'Live queue is unavailable right now — ask the counter for your status.',
         updatedAt: new Date().toISOString(),
       });
     }
 
     /* --------------------- Resolve the job --------------------- */
+    // Token-only lookups need the shop to disambiguate. The customer page
+    // knows the slug it was loaded from, so resolve slug → shop_id here.
+    if (!shopId && shopSlug && supabaseAdmin) {
+      const { data: shopRow } = await supabaseAdmin
+        .from('shops')
+        .select('id')
+        .eq('slug', shopSlug)
+        .maybeSingle();
+      if (shopRow?.id) shopId = shopRow.id;
+    }
+
     let job = null;
     if (jobId && /^[0-9a-f-]{36}$/i.test(jobId)) {
       const { data } = await supabaseAdmin

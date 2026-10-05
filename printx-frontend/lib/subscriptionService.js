@@ -17,6 +17,32 @@ const MONTH_MS = 30 * 24 * 60 * 60 * 1000;
 const YEAR_MS = 365 * 24 * 60 * 60 * 1000;
 
 /**
+ * Columns this deployment's `wallet_transactions` table turned out not to have.
+ * Discovered once at runtime (the first insert that names a missing column
+ * trips PGRST204/42703) and remembered, so later upgrades stop paying for the
+ * same failed round-trips.
+ */
+const LEDGER_MISSING_COLUMNS = new Set();
+
+/**
+ * Attribution string for a subscription charge.
+ *
+ * The live `wallet_transactions` table on this project is only
+ * (id, wallet_id, amount, type, description, created_at) — it has no shop_id
+ * and no reference_id. A row written without attribution cannot be traced back
+ * to the shop that paid or the payment that caused it, and cannot be used to
+ * detect a replayed callback. So the shop and payment ids are embedded in the
+ * description, which is the one free-text column guaranteed to exist. This also
+ * gives the replay guard a filter key that works on ANY schema:
+ *
+ *     ?description=like.*<paymentId>*
+ */
+function ledgerDescription({ planId, billingCycle, shopId, paymentId }) {
+  const label = getPlanLabel(planId, billingCycle);
+  return `${label} subscription · shop ${shopId} · payment ${paymentId || 'unknown'}`;
+}
+
+/**
  * Apply a successful payment to the database.
  * @param {object} params
  * @param {string} params.shopId        - shops.id (uuid) or slug in demo mode
@@ -48,6 +74,30 @@ export async function applySubscriptionUpgrade({
   }
 
   // ---- Idempotency: skip if this payment was already applied ----
+  // Plan intents are stateless (lib/planOrders.js), so nothing server-side
+  // marks an intent as "used". A replayed — but genuinely paid — callback
+  // must therefore not re-apply and silently push the expiry forward.
+  //
+  // `wallet_transactions` is the ledger that actually exists on this project
+  // (`subscriptions` / `billing_history` do not), and its only always-present
+  // identifying column is `description`, which carries the payment id. A
+  // failed lookup degrades to "apply anyway" rather than blocking a real
+  // paid upgrade on a schema quirk.
+  if (paymentId) {
+    const { data: applied, error: dupErr } = await supabaseAdmin
+      .from('wallet_transactions')
+      .select('id')
+      .like('description', `*${paymentId}*`)
+      .limit(1);
+    if (!dupErr && applied && applied.length > 0) {
+      console.info(`[subscription] payment ${paymentId} already applied — duplicate ignored`);
+      return { ok: true, expiresAt, duplicate: true };
+    }
+    if (dupErr) {
+      console.warn(`[subscription] duplicate check unavailable (${dupErr.message}) — proceeding`);
+    }
+  }
+
   const { data: existing } = await supabaseAdmin
     .from('subscriptions')
     .select('id')
@@ -86,6 +136,42 @@ export async function applySubscriptionUpgrade({
   if (subErr) {
     // Shop plan already updated; log but don't fail the activation.
     console.error('[subscription] subscriptions insert failed:', subErr);
+  }
+
+  // ---- 2b. Billing transaction ledger ----
+  // wallet_transactions is the live table that exists on this project
+  // (`subscriptions` / `billing_history` do not). Progressive column-drop so
+  // a schema difference here can never undo a paid upgrade — the shop row above
+  // is already written by this point.
+  //
+  // Columns absent on this deployment (shop_id / reference_id / status) are
+  // dropped permanently after the first discovery, so later upgrades write the
+  // row in a single round-trip instead of three.
+  const txPayload = {
+    shop_id: shopId,
+    type: 'credit',
+    amount: amountRupees,
+    description: ledgerDescription({ planId, billingCycle, shopId, paymentId }),
+    reference_id: paymentId || null,
+    status: 'success',
+  };
+  let txRow = { ...txPayload };
+  for (const col of LEDGER_MISSING_COLUMNS) delete txRow[col];
+
+  for (let i = 0; i < 4; i++) {
+    const { error: txErr } = await supabaseAdmin.from('wallet_transactions').insert(txRow);
+    if (!txErr) break;
+    const missing =
+      (txErr.message || '').match(/'([\w]+)'\s+column|column\s+"(\w+)"/)?.[1] ||
+      (txErr.message || '').match(/'([\w]+)'\s+column|column\s+"(\w+)"/)?.[2];
+    if ((txErr.code === 'PGRST204' || txErr.code === '42703') && missing && missing in txRow) {
+      console.warn(`[subscription] wallet_transactions missing column "${missing}" — dropping it`);
+      LEDGER_MISSING_COLUMNS.add(missing);
+      delete txRow[missing];
+      continue;
+    }
+    console.error('[subscription] wallet_transactions insert failed:', txErr.message);
+    break;
   }
 
   console.info(`[subscription] activated: shop=${shopId} plan=${label} until=${expiresAt || 'never'}`);

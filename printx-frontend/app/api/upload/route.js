@@ -44,6 +44,42 @@ const BUCKETS = ['print-files', 'print-uploads'];
 const supabaseAdmin =
   SUPABASE_URL && SUPABASE_SERVICE_KEY ? createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY) : null;
 
+/**
+ * Columns the LIVE print_jobs schema has rejected so far.
+ *
+ * Module scope → persists for the lifetime of a warm serverless instance, so
+ * schema drift is discovered once per cold start instead of once per order.
+ * Populated adaptively from 42703 / PGRST204 responses.
+ */
+const MISSING_COLUMNS = new Set();
+
+/** Same adaptive cache for the `orders` sidecar row (its own column set). */
+const MISSING_ORDER_COLUMNS = new Set();
+
+/**
+ * Reshape a payload using what we already know the live schema lacks, so a
+ * cached column is skipped on the FIRST request instead of costing a retry.
+ *
+ * `page_count` is REMAPPED onto `pages` rather than dropped — otherwise every
+ * cached order would silently lose its page count and fall back to the column
+ * default (1), which corrupts queue maths and the print ticket.
+ */
+function applyKnownColumns(payload) {
+  if (MISSING_COLUMNS.size === 0) return payload;
+  let out = payload;
+  for (const col of MISSING_COLUMNS) {
+    if (!Object.prototype.hasOwnProperty.call(out, col)) continue;
+    if (col === 'page_count' && out.pages === undefined) {
+      const { page_count: pagesValue, ...rest } = out;
+      out = { ...rest, pages: pagesValue };
+    } else {
+      const { [col]: _dropped, ...rest } = out;
+      out = rest;
+    }
+  }
+  return out;
+}
+
 export async function POST(request) {
   try {
     const formData = await request.formData();
@@ -496,11 +532,28 @@ export async function POST(request) {
     // Insert with progressive schema fallback: on schema drift (missing
     // column → 42703 / PGRST204), drop or remap the offending key and retry
     // until the payload fits the live schema, so the job row is never blocked.
+    //
+    // PERFORMANCE/SCHEMA-DRIFT: the columns this schema is missing are a
+    // FIXED set, but the naive version re-sent the FULL payload on every
+    // retry — one failing column per round trip. Against this schema that
+    // meant 8 INSERT requests per order (original_price, page_count,
+    // paper_size, payment_method, payment_mode, payment_status, total_price
+    // each failing in turn), which is what filled the Vercel logs with
+    // "retries" and pushed functions past their duration limit.
+    //
+    // `MISSING_COLUMNS` remembers what the live schema rejected, so every
+    // order after the first one is a SINGLE insert. Module scope survives
+    // across requests inside a warm serverless instance, so the first order
+    // still pays the discovery cost once per cold start.
     const insertJobWithFallback = async (basePayload) => {
       const dropped = [];
       let attemptPayload = { ...basePayload };
       let lastErr = null;
       for (let attempt = 0; attempt < 20 && Object.keys(attemptPayload).length > 0; attempt++) {
+        // Pre-apply everything already known to be missing so the FIRST
+        // request of an order is usually also the only one.
+        attemptPayload = applyKnownColumns(attemptPayload);
+
         const res = await supabaseAdmin
           .from('print_jobs')
           .insert(attemptPayload)
@@ -530,6 +583,7 @@ export async function POST(request) {
             attemptPayload = rest;
           }
           dropped.push(missing);
+          MISSING_COLUMNS.add(missing); // remember — never re-test this column
           continue;
         }
         break; // non-schema error — don't loop
@@ -602,29 +656,45 @@ export async function POST(request) {
       status: 'PENDING',
       ...(dailyTokenNo != null ? { token_no: dailyTokenNo } : {}),
     };
-    let { error: sidecarErr } = await supabaseAdmin.from('orders').insert(sidecarPayload);
+    // Same adaptive strategy as print_jobs, with its own cache so the orders
+    // sidecar also converges to ONE insert per order instead of re-probing
+    // is_priority / payment_status on every single upload.
+    const insertSidecarWithFallback = async (basePayload) => {
+      let row = { ...basePayload };
+      let err = null;
+      for (let attempt = 0; attempt < 8; attempt++) {
+        if (MISSING_ORDER_COLUMNS.size > 0) {
+          row = Object.fromEntries(
+            Object.entries(row).filter(([k]) => !MISSING_ORDER_COLUMNS.has(k))
+          );
+        }
+        const res = await supabaseAdmin.from('orders').insert(row);
+        err = res.error;
+        if (!err) return null;
+
+        const missing = (err.message || '').match(/'([\w]+)'\s+column|column\s+"(\w+)"/);
+        const col = missing?.[1] || missing?.[2] ||
+          Object.keys(row).find((c) => (err.message || '').includes(c));
+        // Only schema drift is adaptive; a duplicate token_no or any other
+        // real failure is returned so the caller can react.
+        if ((err.code === 'PGRST204' || err.code === '42703') && col && col in row) {
+          console.warn(`[upload] orders sidecar: dropping missing column "${col}"`);
+          delete row[col];
+          MISSING_ORDER_COLUMNS.add(col);
+          continue;
+        }
+        break;
+      }
+      return err;
+    };
+
+    let sidecarErr = await insertSidecarWithFallback(sidecarPayload);
     if (sidecarErr && dailyTokenNo != null) {
       // Unique-token clash (concurrent upload) or a token_no surprise —
       // retry WITHOUT it so binding/paper/token-link data still lands.
       console.warn('[upload] sidecar retry without token_no:', sidecarErr.message);
       const { token_no: _droppedToken, ...withoutToken } = sidecarPayload;
-      const retry = await supabaseAdmin.from('orders').insert(withoutToken);
-      sidecarErr = retry.error || null;
-    }
-    // Generic schema-drift fallback: when a column doesn't exist on this
-    // deployment's `orders` table (PGRST204/42703), drop just that key and
-    // retry — up to 3 columns — so page_range/binding/token data still lands.
-    if (sidecarErr) {
-      let sidecarRow = { ...sidecarPayload };
-      for (let attempt = 0; sidecarErr && attempt < 8; attempt++) {
-        const missing = (sidecarErr.message || '').match(/'([\w]+)'\s+column|column\s+"(\w+)"/);
-        const col = missing?.[1] || missing?.[2];
-        if (!col || !(col in sidecarRow)) break;
-        console.warn(`[upload] orders sidecar: dropping missing column "${col}"`);
-        delete sidecarRow[col];
-        const retry = await supabaseAdmin.from('orders').insert(sidecarRow);
-        sidecarErr = retry.error || null;
-      }
+      sidecarErr = await insertSidecarWithFallback(withoutToken);
     }
     if (sidecarErr) {
       // Non-fatal: the print job already exists; only the queue's binding
@@ -682,8 +752,24 @@ export async function POST(request) {
       storageWarning,
     });
   } catch (err) {
+    // Always answer with a JSON body carrying a usable reason — a raw throw
+    // here rendered Next.js' HTML error page, which the client's
+    // `res.json()` could not parse, so a failed order looked like an
+    // unexplained "upload failed" instead of an actionable message.
     console.error('[upload] unexpected error:', err);
-    return NextResponse.json({ success: false, error: 'Internal server error' }, { status: 500 });
+    const detail = err?.message || String(err || '');
+    return NextResponse.json(
+      {
+        success: false,
+        error: detail
+          ? `Order placement failed: ${detail}`
+          : 'Order placement failed, please try again.',
+        // Postgres error codes are what Vercel log triage actually needs
+        // (42703 = missing column, PGRST204 = unknown column in payload).
+        code: err?.code || null,
+      },
+      { status: 500 }
+    );
   }
 }
 

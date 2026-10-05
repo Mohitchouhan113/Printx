@@ -4,8 +4,12 @@
  * PrintX Step 5: Real-Time Token Tracking Screen
  * - Giant animated token card (spring pop-in + confetti burst)
  * - Live progress bar [Order Received] -> [Printing...] -> [Ready for Pickup]
- * - WebSocket listener for PAYMENT_RECEIVED and ORDER_UPDATE
+ * - Supabase Realtime listener on this order's row (postgres_changes UPDATE)
  * - WhatsApp notification banner
+ *
+ * STRICT MODE: the progress bar moves ONLY when the vendor (or the print
+ * agent) writes a new status to the database. There is no client timer and no
+ * local "assume it got printed" fallback — the bar reflects stored state.
  */
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
@@ -13,10 +17,11 @@ import { motion, AnimatePresence, useSpring, useTransition } from 'framer-motion
 import confetti from 'canvas-confetti';
 import { PartyPopper, Mail, Clock, CheckCircle } from 'lucide-react';
 import ThemeToggle from './ThemeToggle';
+import { supabase, isSupabaseConfigured } from '../../lib/supabaseClient';
 
 export default function TokenScreen({
   order,
-  onOrderUpdate,    // called when ORDER_UPDATE arrives live
+  onOrderUpdate,    // called when the order status changes in the database
   onComplete,       // optional: called on any terminal event (COMPLETED / Cancelled / etc.)
   onBack,
 }) {
@@ -64,84 +69,76 @@ export default function TokenScreen({
     return () => clearTimeout(t);
   }, []);
 
-  // WebSocket: PAYMENT_RECEIVED + ORDER_UPDATE for THIS order only
+  // Map a database status to a progress stage (0 = received, 1 = printing,
+  // 2 = ready for pickup). Only statuses actually written by the vendor /
+  // print agent advance the bar — there is no time-based progression.
+  const statusToStage = useCallback((status) => {
+    const s = String(status || '').toUpperCase();
+    if (/COMPLETED|CANCELLED|CANCELED|READY/.test(s)) return 2;
+    if (/PRINTING|IN_PROGRESS|STARTED/.test(s)) return 1;
+    if (/PENDING|QUEUED|RECEIVED/.test(s)) return 0;
+    return 0;
+  }, []);
+
+  // Live status: Supabase Realtime on THIS order's print_jobs row.
+  //
+  // Replaces the old hardcoded ws://<host>/socket.io connection, which pointed
+  // at a socket.io server that does not exist on this deployment — so the
+  // progress bar never received a single event and only appeared to advance
+  // through the (now removed) local timers.
   useEffect(() => {
     if (!order) return;
-    const orderId = order.order_id;
+    const orderId = order.order_id || order.jobId || order.id;
+    if (!orderId || !/^[0-9a-f-]{36}$/i.test(String(orderId))) return;
+    if (!isSupabaseConfigured || !supabase) return;
 
-    const socket = new WebSocket(
-      `${window.location.protocol === 'https:' ? 'wss://' : 'ws://'}${window.location.host}/socket.io`
-    );
     let isMounted = true;
 
-    socket.onmessage = (e) => {
-      try {
-        const msg = JSON.parse(e.data);
-        const data = msg.data || {};
-        const msgOrderId = data.order_id;
-
-        if (msgOrderId !== orderId) return;
-
-        // PAYMENT_RECEIVED: advance from stage 0 → 1 (Printing)
-        if (msg.event === 'PAYMENT_RECEIVED' && stage === 0) {
-          if (isMounted) {
-            setStage(1);
-            stageRef.current = 1;
-            if (onOrderUpdate) onOrderUpdate({ stage: 1, status: 'PAID', payment_id: data.payment_id });
-          }
-        }
-
-        // ORDER_UPDATE: possible transitions
-        if (msg.event === 'ORDER_UPDATE') {
-          const newStage = translateUpdateToStage(msg, stage, data);
-          if (newStage !== stage && isMounted) {
-            setStage(newStage);
-            stageRef.current = newStage;
-            if (onOrderUpdate) onOrderUpdate({ stage: newStage, ...data });
-          }
-        }
-
-        // Anything else that sets stage 2 (COMPLETED / READY_FOR_PICKUP)
-        // We let translateUpdateToStage handle that via data.
-
-        // If terminal stage already reached and we get "COMPLETED" or similar, just ensure onComplete called once
-        if (isTerminated && typeof onComplete === 'function' && !data._alreadyCalled) {
-          // Avoid spamming if already at terminal
-        }
-      } catch {
-        // ignore malformed WebSocket frames
+    const applyRow = (row) => {
+      if (!isMounted || !row?.id || row.id !== orderId) return;
+      const next = statusToStage(row.status);
+      setStage((prev) => (next === prev ? prev : (stageRef.current = next, next)));
+      if (onOrderUpdate) {
+        onOrderUpdate({ stage: next, order_status: row.status, status: row.status });
+      }
+      if (next >= 2 && typeof onComplete === 'function') {
+        onComplete({ stage: next, order_status: row.status });
       }
     };
 
-    socket.onerror = () => {};
-    socket.onclose = () => {};
+    const channel = supabase
+      .channel(`order-status-${orderId}`)
+      .on(
+        'postgres_changes',
+        {
+          event: 'UPDATE',
+          schema: 'public',
+          table: 'print_jobs',
+          filter: `id=eq.${orderId}`,
+        },
+        (payload) => applyRow(payload.new)
+      )
+      .on(
+        'postgres_changes',
+        {
+          event: 'INSERT',
+          schema: 'public',
+          table: 'print_jobs',
+          filter: `id=eq.${orderId}`,
+        },
+        (payload) => applyRow(payload.new)
+      )
+      .subscribe();
+
     return () => {
       isMounted = false;
-      socket.close();
+      try {
+        supabase.removeChannel(channel);
+      } catch {
+        /* noop */
+      }
     };
-  }, [order, stage, onOrderUpdate, onComplete]);
-
-  // Translate ORDER_UPDATE payload to a stage number
-  // data can contain: order_status, payment_status, etc.
-  const translateUpdateToStage = useCallback((msg, currentStage, data) => {
-    // If data already has a stage or an explicit terminal flag, use it
-    if (data && data.stage !== undefined) return data.stage;
-    if (data && data.terminal && currentStage < 2) return 2;
-
-    // Known statuses:
-    const status = (data && data.order_status) || '';
-    if (/completed|canceled|cancelled|ready/i.test(status)) return 2;
-    if (/in_progress|started|printing/i.test(status)) return 1;
-
-    // Payment-side terminal
-    const pStatus = (data && data.payment_status) || '';
-    if (/paid/.test(pStatus) && currentStage === 0) return 1;
-
-    // Default: don't downgrade (stay where we are)
-    return currentStage;
-  }, []);
-
-  // Progress step labels
+  }, [order, onOrderUpdate, onComplete, statusToStage]);// Progress step labels
   const steps = [
     { key: 'received', label: 'Order Received' },
     { key: 'printing', label: 'Printing...' },
@@ -368,30 +365,11 @@ export default function TokenScreen({
         </div>
       </motion.div>
 
-      {/* ---------- DEV HELPERS (hidden in production) ---------- */}
-      {process.env.NODE_ENV !== 'production' && (
-        <div className="mt-4 flex gap-2">
-          <button
-            onClick={() => {
-              setStage(1);
-              if (onOrderUpdate) onOrderUpdate({ stage: 1, order_status: 'IN_PROGRESS' });
-            }}
-            className="flex-1 py-2 rounded-xl border border-gray-200 dark:border-slate-700 text-sm text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-slate-800 transition-colors"
-          >
-            Dev: Set Printing
-          </button>
-          <button
-            onClick={() => {
-              setStage(2);
-              if (onOrderUpdate) onOrderUpdate({ stage: 2, order_status: 'COMPLETED' });
-              if (onComplete) onComplete({ stage: 2, order_status: 'COMPLETED' });
-            }}
-            className="flex-1 py-2 rounded-xl bg-green-100 dark:bg-green-900/40 text-green-700 dark:text-green-300 text-sm font-medium hover:bg-green-200 dark:hover:bg-green-900/60 transition-colors"
-          >
-            Dev: Ready for Pickup
-          </button>
-        </div>
-      )}
+      {/* NOTE: dev-only status buttons ("Dev: Ready for Pickup") were removed.
+       They advanced the customer's progress bar to a terminal state WITHOUT
+       writing anything to the database, so the phone claimed the job was
+       ready while the vendor queue still held it as PENDING. Status now
+       moves only via real ORDER_UPDATE events from the server. */}
     </motion.div>
   );
 }

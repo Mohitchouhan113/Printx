@@ -1,7 +1,6 @@
 import { NextResponse } from 'next/server';
 import crypto from 'crypto';
-import { applySubscriptionUpgrade } from '../../../../lib/subscriptionService';
-import { getPlanLabel, PLANS } from '../../../../lib/plans';
+import { PLANS } from '../../../../lib/plans';
 
 /**
  * POST /api/razorpay/verify
@@ -41,26 +40,26 @@ export async function POST(request) {
       return NextResponse.json({ success: false, error: 'planId and shopId are required' }, { status: 400 });
     }
 
-    /* --------------------- Demo mode --------------------- */
-    const isDemoOrder = String(orderId).startsWith('order_demo_') || String(paymentId).startsWith('pay_demo_');
-    if (!RZP_KEY_SECRET || isDemoOrder) {
-      const result = await applySubscriptionUpgrade({
-        shopId,
-        planId,
-        billingCycle,
-        amountRupees: body.amountRupees ?? 0,
-        paymentId,
-        orderId,
-      });
-      console.warn(`[razorpay/verify] DEMO verification accepted for ${paymentId}`);
-      return NextResponse.json({
-        success: true,
-        demo: true,
-        verified: true,
-        planId,
-        planLabel: getPlanLabel(planId, billingCycle),
-        expiresAt: result.expiresAt,
-      });
+    /* --------------------- Payment configuration ---------------------
+     * SECURITY: this route used to have a demo branch —
+     *   `if (!RZP_KEY_SECRET || orderId.startsWith('order_demo_')) → upgrade`
+     * — which meant ANY caller could POST forged `order_demo_*` / `pay_demo_*`
+     * ids with a garbage signature and receive a free paid plan (verified
+     * live: a shop went pro → lifetime with no payment). A missing key
+     * configuration also bypassed verification entirely.
+     *
+     * Upgrades now happen ONLY through /api/billing/verify-payment, which
+     * checks the HMAC signature AND asks Razorpay whether the order was
+     * actually PAID. This route is retained for the (already-verified)
+     * webhook-less legacy client flow and now REFUSES to activate anything:
+     * it tells the caller to use the secured endpoint.
+     */
+    if (!RZP_KEY_SECRET) {
+      console.error('[razorpay/verify] RAZORPAY_KEY_SECRET is not configured — refusing to activate');
+      return NextResponse.json(
+        { success: false, error: 'Payments are not configured on this deployment.' },
+        { status: 503 }
+      );
     }
 
     /* --------------------- Signature check --------------------- */
@@ -78,31 +77,20 @@ export async function POST(request) {
       );
     }
 
-    /* --------------------- Apply upgrade --------------------- */
-    const result = await applySubscriptionUpgrade({
-      shopId,
-      planId,
-      billingCycle,
-      amountRupees: body.amountRupees ?? 0,
-      paymentId,
-      orderId,
-    });
-
-    if (!result.ok) {
-      return NextResponse.json(
-        { success: false, error: result.error || 'Upgrade could not be applied' },
-        { status: 500 }
-      );
-    }
-
-    return NextResponse.json({
-      success: true,
-      verified: true,
-      planId,
-      planLabel: getPlanLabel(planId, billingCycle),
-      expiresAt: result.expiresAt,
-      duplicate: result.duplicate || false,
-    });
+    /* --------------------- Refuse --------------------- */
+    // Signature is well-formed here, but the plan still comes from the
+    // client body. Only /api/billing/verify-payment may apply an upgrade.
+    console.warn(
+      '[razorpay/verify] SECURITY: activation via this route is disabled — use /api/billing/verify-payment',
+      { orderId, paymentId }
+    );
+    return NextResponse.json(
+      {
+        success: false,
+        error: 'Plan activation must be completed through /api/billing/verify-payment.',
+      },
+      { status: 400 }
+    );
   } catch (err) {
     console.error('[razorpay/verify] error:', err);
     return NextResponse.json({ success: false, error: 'Verification failed' }, { status: 500 });

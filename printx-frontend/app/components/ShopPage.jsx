@@ -94,7 +94,9 @@ export default function ShopPage({ shopId }) {
     setStep('payment');
   }, []);
 
-  // Step 4/5 bridge: any order payload (real API or simulated) lands here and advances to token screen.
+  // Step 4/5 bridge: a REAL order payload from the server lands here and advances to token screen.
+  // There is deliberately no mock fallback — if the order was not persisted the
+  // flow must surface an error instead of showing a fabricated token.
   const handleOrderCreated = useCallback((orderData) => {
     setOrder(orderData);
     setStep('token');
@@ -110,37 +112,16 @@ export default function ShopPage({ shopId }) {
     }
   }, []);
 
-  // Step 4: fallback/simulate success — create a fake order in local state & advance
-  // (used by PaymentModal's "Simulate Payment Success (Dev Mode)" button)
-  const handleSimulatePayment = useCallback(
-    (orderData) => {
-      const fakeOrder = {
-        ...orderData,
-        token_no: Number(orderData.token_no) || Math.floor(Math.random() * 99) + 1,
-        payment_id: `PAY-DEV-${Date.now()}`,
-        order_status: 'IN_PROGRESS',
-        payment_status: 'PAID',
-        created_at: new Date().toISOString(),
-      };
-      setOrder(fakeOrder);
-      setStep('token');
-    },
-    []
-  );
-
-  // On payment success (websocket trigger), go to token screen and later simulate the rest
+  // On payment success (websocket trigger) — go to the token screen.
+  //
+  // NO TIMER-DRIVEN STATUS CHANGES. The progress bar advances ONLY when a real
+  // ORDER_UPDATE arrives from the server (vendor action / DB update). A client
+  // timer used to walk Queued → Printing → Ready for Pickup automatically,
+  // which made unprinted orders look finished and hid real failures.
   const handlePaymentReceived = useCallback(
     (update) => {
       const merged = { ...order, ...update };
       setOrder(merged);
-      // Start printing immediately after payment
-      setTimeout(() => {
-        setTokenState((prev) => ({ ...prev, stage: 1 }));
-      }, 600);
-      // Simulate "Ready for Pickup" after a short delay (demo flow)
-      setTimeout(() => {
-        setTokenState((prev) => ({ stage: 2, order_status: 'COMPLETED' }));
-      }, 4500);
     },
     [order]
   );
@@ -241,7 +222,6 @@ export default function ShopPage({ shopId }) {
             onComplete={handlePaymentReceived}
             onError={setError}
             onBack={goBack}
-            onSimulate={handleSimulatePayment}
           />
         )}
 

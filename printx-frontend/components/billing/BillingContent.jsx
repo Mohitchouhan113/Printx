@@ -239,36 +239,31 @@ export default function BillingContent({ shop = null, shopId = null, shopSlug = 
       return;
     }
 
-    // ---- Success: update UI instantly + persist a REAL invoice row + refresh context ----
-    const plan = PLANS[planId];
+    // ---- Success ----
+    // The plan shown here is the one the SERVER activated (result.planId),
+    // not the one that was clicked — the server decides what was paid for.
+    const activatedPlanId = result.planId || planId;
+    const plan = PLANS[activatedPlanId] || PLANS[planId];
     const amount = planId === 'lifetime' ? plan.lifetime : cycle === 'yearly' ? plan.yearly : plan.monthly;
 
-    setCurrentPlan(planId);
+    setCurrentPlan(normalizePlanId(activatedPlanId));
     setCurrentExpiry(result.expiresAt || null);
 
-    setInvoices((prev) => [
-      {
-        id: `INV-${new Date().getFullYear()}-${String(Math.floor(Math.random() * 90) + 10)}`,
-        date: new Date().toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }),
-        amount,
-        plan: plan.name,
-        status: 'Paid',
-        cycle: cycle === 'lifetime' ? 'Lifetime' : cycle === 'yearly' ? 'Yearly' : 'Monthly',
-      },
-      ...prev,
-    ]);
+    // Invoices are REAL database rows — never synthesise one here. Reload
+    // from `subscriptions` so the list only ever shows persisted payments.
+    await loadBillingData();
 
     setSuccessTx({
-      txId: `TXN${Date.now().toString().slice(-10)}`,
-      planId,
+      // Real Razorpay payment reference; no fabricated TXN id.
+      txId: result.paymentId || result.verifiedBy || '—',
+      planId: activatedPlanId,
       amount,
       cycle,
       expiresAt: result.expiresAt,
-      demo: result.demo,
     });
 
-    // Server-side activation (verify route) already wrote the DB row —
-    // refresh the shared context so every tab sees the new plan.
+    // Server-side activation already wrote the DB row — refresh the shared
+    // context so every tab sees the new plan.
     onShopRefresh?.();
   };
 

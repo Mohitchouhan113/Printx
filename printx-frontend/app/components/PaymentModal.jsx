@@ -48,7 +48,6 @@ export default function PaymentModal({
   onComplete,        // called when PAYMENT_RECEIVED for this order
   onError,          // called on recoverable failures
   onBack,
-  onSimulate,       // dev-mode fallback: call when user clicks "Simulate Payment Success"
 }) {
   // Form state
   const [fullName, setFullName] = useState('');
@@ -140,66 +139,33 @@ export default function PaymentModal({
       setSubmitting(false);
 
       // When order is created, jump to the token screen immediately
-      // (parent handles PAYMENT_RECEIVED / simulate / etc.)
+      // (parent handles PAYMENT_RECEIVED)
       if (typeof onBack === 'function') {
         onBack('token'); // tell parent to advance to payment -> token
       }
     } catch (err) {
-      // Auto-fallback to Step 5 with a simulated local order if backend is unreachable.
-      // This ensures the UI never freezes — the user always sees a token screen.
-      console.warn('[PaymentModal] Order create failed (backend offline?) — simulating local token.', err);
-      if (typeof onSimulate === 'function') {
-        // Build a minimal local order so the token screen can render.
-        onSimulate({
-          order_id: 'DEV-' + Date.now(),
-          token_no: Math.floor(Math.random() * 99) + 1,
-          total_amount: (analysis?.bw_pages_count || 0) * (shop?.rates?.bw || 2) * (config?.copies || 1),
-          order_status: 'IN_PROGRESS',
-          payment_status: 'PAID',
-          created_at: new Date().toISOString(),
-        });
-      } else {
-        setFormError(err.message || 'Failed to create order. Please try again.');
+      // STRICT MODE: a failed insert is surfaced to the customer, never
+      // replaced with a fabricated local order. Simulating here produced
+      // tokens that existed in no database row — the vendor never saw the
+      // order and the customer got a "Ready for Pickup" that was fiction.
+      console.error('[PaymentModal] Order create failed:', err);
+      setOrder(null);
+      setOrderCreated(false);
+      setFormError(err.message || 'Order placement failed, please try again.');
+      if (typeof onError === 'function') {
+        onError(new Error(err.message || 'Order placement failed, please try again.'));
       }
       setSubmitting(false);
     }
-  }, [fullName, whatsapp, analysis, config, order, shop, onBack]);
-
-  // When order arrives, wire the dev-mode fallback to the backend simulator if available
-  useEffect(() => {
-    if (!order) return;
-
-    const simulateBtn = document.getElementById('__printx_simulate');
-    if (!simulateBtn) return;
-
-    simulateBtn.addEventListener('click', () => {
-      // Use onSimulate if provided by parent; else try the backend direct webhook
-      if (typeof onSimulate === 'function') {
-        onSimulate(order);
-        return;
-      }
-
-      // Best-effort fallback: hit backend simulate endpoint
-      fetch('http://localhost:3000/api/v1/orders/simulate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          order_id: order.order_id,
-          amount: order.total_amount,
-        }),
-      }).catch(() => {
-        // If backend unreachable, just pretend success so the UI keeps moving
-        if (onSimulate) onSimulate(order);
-      });
-    });
-  }, [order, onSimulate]);
+  }, [fullName, whatsapp, analysis, config, order, shop, onBack, onError]);
 
   // WebSocket listener for this order's PAYMENT_RECEIVED
   useEffect(() => {
     if (!order) return;
     const orderId = order.order_id;      // Backend WebSocket is at the backend origin; if the app is served from a different
-      // host (or the backend is offline), this connection gracefully degrades — the
-      // onSimulate fallback above already ensures the UI keeps moving.
+      // host (or the backend is offline), this connection gracefully degrades —
+      // the order already exists in the database, so the customer can retry
+      // payment from the vendor counter instead of seeing a fake success.
       const socket = new WebSocket(
       'ws://localhost:3000/socket.io'
     );
@@ -450,28 +416,7 @@ export default function PaymentModal({
               <span>Need to pay on this laptop? Use the QR code above — scan it with your phone's UPI app.</span>
             </div>
 
-            {/* Dev mode simulate button */}
-            {process.env.NODE_ENV !== 'production' && (
-              <motion.button
-                id="__printx_simulate"
-                whileHover={{ scale: 1.02 }}
-                whileTap={{ scale: 0.98 }}
-                onClick={() => {
-                  if (typeof onSimulate === 'function') {
-                    onSimulate(order);
-                  } else if (order) {
-                    // ungraceful fallback if parent didn't wire onSimulate
-                    const btn = document.getElementById('__printx_simulate');
-                    if (btn) btn.classList.add('opacity-50');
-                  }
-                }}
-                className="w-full py-2.5 px-4 rounded-xl bg-amber-50 dark:bg-amber-900/40 text-amber-700 dark:text-amber-300 border border-amber-200 dark:border-amber-800 text-sm font-medium flex items-center justify-center gap-2 hover:bg-amber-100 dark:hover:bg-amber-900/60 transition-colors"
-              >
-                <CreditCard className="w-4 h-4" />
-                Simulate Payment Success (Dev Mode)
-              </motion.button>
-            )}
-          </motion.div>
+            </motion.div>
         )}
       </AnimatePresence>
     </motion.div>

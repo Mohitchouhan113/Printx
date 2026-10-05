@@ -36,6 +36,9 @@ export const dynamic = 'force-dynamic';
 
 const KV_PREFIX = 'upi_intent_tx::'; // fallback audit key when the column is absent
 
+/** Bound the realtime SUBSCRIBED handshake so a flaky socket can't hang checkout. */
+const SUBSCRIBE_TIMEOUT_MS = 3000;
+
 const isMissingColumn = (err) =>
   Boolean(err) &&
   (err.code === 'PGRST204' || err.code === '42703' || /column/i.test(err.message || ''));
@@ -66,11 +69,47 @@ async function mirrorToKv(orderId, order, paymentStatus) {
   }
 }
 
-/** Fire-and-forget vendor realtime notify (orders UPDATE already fired above). */
+/**
+ * Fire-and-forget vendor realtime notify.
+ *
+ * CRITICAL: the channel MUST reach the SUBSCRIBED state before `.send()`.
+ * `channel.send()` on a channel that was created but never subscribed is
+ * dropped by the realtime client (it has no server-side subscription yet),
+ * so the vendor dashboard never saw the PAYMENT_CONFIRMED toast. We now
+ * await the SUBSCRIBED handshake, bound it with a timeout so a flaky socket
+ * can never hang the payment response, and always clean the channel up.
+ */
 async function notifyVendor(shopId, payload) {
   if (!shopId) return;
+  let channel = null;
   try {
-    const channel = supabaseAdmin.channel(`print-jobs-${shopId}`);
+    channel = supabaseAdmin.channel(`print-jobs-${shopId}`);
+
+    // Resolve once the server confirms the subscription, or reject on error.
+    await new Promise((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        reject(new Error('realtime subscribe timed out'));
+      }, SUBSCRIBE_TIMEOUT_MS);
+
+      const finish = (fn, arg) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        fn(arg);
+      };
+
+      channel.subscribe((status, err) => {
+        if (status === 'SUBSCRIBED') return finish(resolve);
+        // Terminal failures only; CHANNEL_ERROR/TIMED_OUT/CLOSED end the wait.
+        if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+          return finish(reject, err || new Error(`realtime subscribe: ${status}`));
+        }
+      });
+    });
+
     const res = await channel.send({
       type: 'broadcast',
       event: 'PAYMENT_CONFIRMED',
@@ -78,11 +117,19 @@ async function notifyVendor(shopId, payload) {
     });
     // 'ok' | 'error' | 'timed out' (REST fallback on hosted realtime)
     if (res !== 'ok') throw new Error(`realtime send: ${res}`);
-    setTimeout(() => {
-      try { supabaseAdmin.removeChannel(channel); } catch { /* noop */ }
-    }, 2000);
+    console.log(`[confirm-direct-upi] vendor broadcast sent for shop ${shopId}`);
   } catch (err) {
+    // Non-fatal: the orders UPDATE above already refires the vendor's
+    // postgres_changes listener, so the payment is recorded regardless.
     console.warn('[confirm-direct-upi] vendor broadcast failed (non-fatal):', err?.message);
+  } finally {
+    if (channel) {
+      try {
+        await supabaseAdmin.removeChannel(channel);
+      } catch {
+        /* noop */
+      }
+    }
   }
 }
 

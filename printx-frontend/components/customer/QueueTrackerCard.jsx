@@ -16,16 +16,17 @@ import { supabase, isSupabaseConfigured } from '../../lib/supabaseClient';
 /**
  * QueueTrackerCard — live queue position + ETA for the customer token screen.
  *
- * Live mode (Supabase configured):
+ * STRICT REAL-DATA MODE (no client-side simulation):
  *   - Fetches /api/jobs/queue-status on mount for the initial position.
  *   - Subscribes to Supabase postgres_changes on `print_jobs` filtered by
  *     shop_id — every INSERT/UPDATE re-polls the endpoint so position and
  *     ETA recalculate instantly without a page refresh.
- *
- * Demo mode (no Supabase):
- *   - Simulates a live queue: position ticks down every ~8 seconds and the
- *     status walks PENDING → PRINTING → COMPLETED so the full UX is visible.
- *   - A short beep fires when the job reaches READY (Web Audio API).
+ *   - Order status comes EXCLUSIVELY from that endpoint (i.e. from the
+ *     database). There is no timer that walks PENDING → PRINTING →
+ *     COMPLETED: "Ready for Pickup" now appears only after a vendor (or the
+ *     print agent) actually sets the row to COMPLETED in Supabase.
+ *   - When Supabase is not configured the card shows an explicit
+ *     "unavailable" state instead of inventing queue data.
  */
 
 const POLL_INTERVAL_MS = 15000; // fallback poll when no realtime event fires
@@ -34,7 +35,7 @@ export default function QueueTrackerCard({
   jobId,
   tokenNumber,
   shopId = 'demo-shop',
-  demo = false,
+  shopSlug,
 }) {
   const [state, setState] = useState({
     loading: true,
@@ -43,7 +44,7 @@ export default function QueueTrackerCard({
     estimatedMinutes: null,
     jobStatus: 'PENDING',
     live: false,
-    demo: false,
+    unavailable: false,
   });
   const [beeped, setBeeped] = useState(false);
   const audioCtxRef = useRef(null);
@@ -87,11 +88,15 @@ export default function QueueTrackerCard({
       if (jobId) params.set('jobId', jobId);
       if (tokenNumber) params.set('token', tokenNumber);
       if (shopId) params.set('shopId', shopId);
+      if (shopSlug) params.set('shopSlug', shopSlug);
 
       const res = await fetch(`/api/jobs/queue-status?${params.toString()}`);
       const data = await res.json();
       if (!res.ok || !data.success) return;
 
+      // Status is taken verbatim from the DB-backed endpoint. No client-side
+      // progression — if the endpoint reports unavailable we say so plainly
+      // rather than pretending the order is moving.
       setState((prev) => ({
         ...prev,
         loading: false,
@@ -99,7 +104,7 @@ export default function QueueTrackerCard({
         totalInQueue: data.totalInQueue ?? data.queuePosition,
         estimatedMinutes: data.estimatedMinutes,
         jobStatus: data.jobStatus || prev.jobStatus,
-        demo: Boolean(data.demo),
+        unavailable: Boolean(data.unavailable),
       }));
     } catch {
       /* network hiccup — keep last known state */
@@ -113,32 +118,10 @@ export default function QueueTrackerCard({
 
   /* ------------------------- Realtime subscription ------------------------- */
   useEffect(() => {
-    if (!isSupabaseConfigured || !supabase || demo) {
-      // Demo simulation: walk the job through its lifecycle
-      if (!demo) return;
-      let pos = 3;
-      let status = 'PENDING';
-      const timer = setInterval(() => {
-        if (status === 'PENDING') {
-          pos -= 1;
-          if (pos <= 1) {
-            status = 'PRINTING';
-          }
-        } else if (status === 'PRINTING') {
-          status = 'COMPLETED';
-        }
-        setState((prev) => ({
-          ...prev,
-          loading: false,
-          queuePosition: Math.max(1, pos),
-          totalInQueue: Math.max(1, pos),
-          estimatedMinutes: status === 'COMPLETED' ? 0 : Math.max(0, Math.round((pos - 1) * 1.5 * 10) / 10),
-          jobStatus: status,
-          demo: true,
-        }));
-        if (status === 'COMPLETED') beep();
-      }, 8000);
-      return () => clearInterval(timer);
+    if (!isSupabaseConfigured || !supabase) {
+      // No database configured — report the truth instead of simulating.
+      setState((prev) => ({ ...prev, loading: false, unavailable: true }));
+      return;
     }
 
     // Live mode — subscribe to any change on this shop's print_jobs
@@ -172,14 +155,14 @@ export default function QueueTrackerCard({
       } catch { /* noop */ }
       clearInterval(poll);
     };
-  }, [shopId, demo, fetchStatus, beep]);
+  }, [shopId, fetchStatus]);
 
   /* ------------------------- Beep when ready ------------------------- */
   useEffect(() => {
     if (state.jobStatus === 'COMPLETED') beep();
   }, [state.jobStatus, beep]);
 
-  const { loading, queuePosition, estimatedMinutes, jobStatus, live, demo: isDemo } = state;
+  const { loading, queuePosition, estimatedMinutes, jobStatus, live, unavailable } = state;
   // Orders ahead of this customer (position includes the customer's own job).
   const ordersAhead = Math.max(0, (queuePosition || 1) - 1);
 
@@ -240,24 +223,24 @@ export default function QueueTrackerCard({
           </div>
           <span
             className={`inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-full border ${
-              isDemo
+              unavailable
                 ? 'bg-slate-800 text-slate-400 border-slate-700'
                 : live
                   ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30'
                   : 'bg-amber-500/15 text-amber-400 border-amber-500/30'
             }`}
           >
-            <span className={`relative flex h-1.5 w-1.5 ${live && !isDemo ? '' : ''}`}>
-              {live && !isDemo && (
+            <span className="relative flex h-1.5 w-1.5">
+              {live && !unavailable && (
                 <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
               )}
               <span
                 className={`relative inline-flex rounded-full h-1.5 w-1.5 ${
-                  isDemo ? 'bg-slate-500' : live ? 'bg-emerald-500' : 'bg-amber-500'
+                  unavailable ? 'bg-slate-500' : live ? 'bg-emerald-500' : 'bg-amber-500'
                 }`}
               />
             </span>
-            {isDemo ? 'Simulated' : live ? 'Live' : 'Polling'}
+            {unavailable ? 'Unavailable' : live ? 'Live' : 'Polling'}
           </span>
         </div>
 

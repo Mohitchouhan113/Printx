@@ -405,8 +405,27 @@ export default function LiveQueueTable({ shopId = 'demo-shop', initialOrders = [
     const applyBinding = (row) => {
       if (!row?.id) return;
       bindingsRef.current.set(row.id, row);
-      setOrders((prev) =>
-        prev.map((o) =>
+      setOrders((prev) => {
+        const exists = prev.some((o) => o.id === row.id);
+        if (!exists) {
+          // The orders INSERT is a real, persisted customer order. If its
+          // print_jobs INSERT was missed (or the two tables are published
+          // independently), append it now so the counter queue is never
+          // missing an order that exists in the database. The sidecar reuses
+          // the print_jobs id as join key, so this dedupes against the row
+          // the print_jobs INSERT already added.
+          const sidecarJob = normalizeJob({
+            ...row,
+            page_count: row.pages ?? row.page_count,
+            // orders carries token_no (the daily #n) rather than token_number
+            token_number: row.token_number || (row.token_no != null ? `#${row.token_no}` : undefined),
+            customer_name: row.customer_name || 'Walk-in Customer',
+            file_name: row.file_name || 'document',
+            created_at: row.created_at || new Date().toISOString(),
+          });
+          return [sidecarJob, ...prev];
+        }
+        return prev.map((o) =>
           o.id === row.id
             ? {
                 ...o,
@@ -418,10 +437,12 @@ export default function LiveQueueTable({ shopId = 'demo-shop', initialOrders = [
                 // ⚡ express flag lands with the sidecar (print_jobs INSERT
                 // usually wins the race — patch it in without a refresh)
                 is_priority: isPriorityRow(row) || o.is_priority,
+                // Status changes mirrored on the sidecar must reach the queue
+                status: row.status || o.status,
               }
             : o
-        )
-      );
+        );
+      });
     };
 
     const channel = supabase
@@ -472,9 +493,13 @@ export default function LiveQueueTable({ shopId = 'demo-shop', initialOrders = [
           // alert ("Naya order aaya hai! …"). The chime is skipped when the
           // print_jobs INSERT already rang <2s ago so one order never
           // double-rings — speech always follows immediately either way.
-          if ((payload.eventType || payload.event) === 'INSERT' && soundboxRef.current) {
+          const evt = payload.eventType || payload.event;
+          if (evt === 'INSERT') {
+            // New order landed in the database → ring the counter chime and
+            // notify the parent (instant queue append happens in applyBinding).
             if (Date.now() - lastChimeAtRef.current > 2000) newJobChime();
             speakOrderAlert(payload.new);
+            onNewOrder?.(payload.new);
           }
         }
       )
@@ -519,7 +544,7 @@ export default function LiveQueueTable({ shopId = 'demo-shop', initialOrders = [
         /* noop */
       }
     };
-  }, [shopId, newJobChime, onNewOrder, autoPrintJob]);
+  }, [shopId, newJobChime, onNewOrder, autoPrintJob, speakOrderAlert]);
 
   /* ------------------- BroadcastChannel cross-tab fallback ------------------- */
   useEffect(() => {
@@ -1287,10 +1312,25 @@ function ActionButton({ label, icon, onClick, href, download, disabled, tone = '
 /* Helpers                                                             */
 /* ------------------------------------------------------------------ */
 /** Map a Supabase print_jobs row (snake_case) into the UI shape. */
+/**
+ * Canonical status vocabulary.
+ *
+ * The database stores 'PENDING' as the queued state, but 'QUEUED' is also
+ * accepted anywhere a status is written or read (spec wording). Normalising
+ * here means an order inserted as either value renders in the same queue
+ * column instead of disappearing from the vendor's filtered lists.
+ */
+function canonStatus(s) {
+  const v = String(s || '').toUpperCase();
+  if (v === 'QUEUED') return 'PENDING';
+  return v;
+}
+
 function normalizeJob(job = {}) {
   // Binding can arrive as a dedicated column or inside config jsonb
   // (upload route writes both so the badge survives schema drift).
   const cfg = job.config || {};
+  const rawStatus = job.status || cfg.status || 'PENDING';
   return {
     id: job.id,
     token_number: job.token_number || '#TK-??',
@@ -1307,7 +1347,7 @@ function normalizeJob(job = {}) {
     is_deleted_from_storage: job.is_deleted_from_storage || false,
     is_priority: isPriorityRow(job),
     files_metadata: job.files_metadata || null,
-    status: job.status || 'PENDING',
+    status: canonStatus(rawStatus),
     auto_printed: job.auto_printed || false,
     created_at: job.created_at || new Date().toISOString(),
   };

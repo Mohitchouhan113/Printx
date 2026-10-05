@@ -275,7 +275,12 @@ export default function DashboardOverview() {
    *   efficiency    — completed vs errored prints; 100 when no history
    */
   const liveStats = useMemo(() => {
-    const norm = (s) => String(s || '').toUpperCase();
+    // 'QUEUED' is accepted as an alias for the stored 'PENDING' (queued) state so
+// orders are never dropped from the active-queue count by a wording mismatch.
+    const norm = (s) => {
+      const v = String(s || '').toUpperCase();
+      return v === 'QUEUED' ? 'PENDING' : v;
+    };
     const todayStart = new Date();
     todayStart.setHours(0, 0, 0, 0);
 

@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { supabaseAdmin, isSupabaseAdminConfigured as isSupabaseConfigured } from '../../../../lib/supabaseAdmin';
+import { selectStrict, isMissingColumn } from '../../../../lib/supabaseSelect';
 import { sendWhatsAppFireAndForget, buildCompletedMessage, calculatePrice } from '../../../../lib/whatsapp';
 
 /**
@@ -14,12 +15,16 @@ import { sendWhatsAppFireAndForget, buildCompletedMessage, calculatePrice } from
  * validates the request and logs what would happen.
  */
 
-const VALID_STATUSES = ['PENDING', 'PRINTING', 'COMPLETED', 'CANCELLED'];
+const VALID_STATUSES = ['PENDING', 'QUEUED', 'PRINTING', 'COMPLETED', 'CANCELLED'];
+
+/** 'QUEUED' is the spec's name for the stored 'PENDING' state — one canonical value in the DB. */
+const canonStatus = (s) => (String(s || '').toUpperCase() === 'QUEUED' ? 'PENDING' : String(s || '').toUpperCase());
 
 export async function POST(request) {
   try {
     const body = await request.json();
-    const { jobId, status, shopId } = body;
+    const { jobId, shopId } = body;
+    const status = canonStatus(body?.status);
 
     /* ---- Validation ---- */
     if (!jobId) {
@@ -48,29 +53,50 @@ export async function POST(request) {
     }
 
     /* ---- Fetch current job ---- */
-    const { data: job, error: fetchErr } = await supabaseAdmin
-      .from('print_jobs')
-      .select('id, status, customer_name, customer_phone, token_number, page_count, config, shop_id')
-      .eq('id', jobId)
-      .single();
+    // `page_count` / `config` are not present on every print_jobs schema and
+    // PostgREST rejects the WHOLE select when one column is missing — which
+    // made every status update answer 404 "Job not found", so orders could
+    // never leave the queue. selectStrict retries with the columns that are
+    // guaranteed to exist.
+    const { data: job, error: fetchErr } = await selectStrict(
+      (cols) =>
+        supabaseAdmin
+          .from('print_jobs')
+          .select(cols)
+          .eq('id', jobId)
+          .single(),
+      'id, status, customer_name, customer_phone, token_number, page_count, pages, config, shop_id',
+      'id, status, customer_name, customer_phone, token_number, pages, shop_id',
+      'print_jobs:update-status'
+    );
 
     if (fetchErr || !job) {
       return NextResponse.json({ success: false, error: 'Job not found' }, { status: 404 });
     }
 
     /* ---- Update status ---- */
-    const updatePayload = { status };
-    if (status === 'COMPLETED') {
-      updatePayload.completed_at = new Date().toISOString();
-    }
-    if (status === 'CANCELLED') {
-      updatePayload.cancelled_at = new Date().toISOString();
-    }
+    // `completed_at` / `cancelled_at` are migration-dependent columns. When
+    // they are absent PostgREST rejects the WHOLE update (PGRST204), which
+    // made "Mark Ready for Pickup" fail with a 500 — an order could never
+    // reach COMPLETED. Retry with just `status` (the field that actually
+    // drives the queue and the customer's screen) when a column is missing.
+    const stampKey =
+      status === 'COMPLETED' ? 'completed_at' : status === 'CANCELLED' ? 'cancelled_at' : null;
 
-    const { error: updateErr } = await supabaseAdmin
-      .from('print_jobs')
-      .update(updatePayload)
-      .eq('id', jobId);
+    const runUpdate = (payload) =>
+      supabaseAdmin.from('print_jobs').update(payload).eq('id', jobId);
+
+    let { error: updateErr } = await runUpdate({
+      status,
+      ...(stampKey ? { [stampKey]: new Date().toISOString() } : {}),
+    });
+
+    if (updateErr && stampKey && isMissingColumn(updateErr)) {
+      console.warn(
+        `[update-status] print_jobs has no "${stampKey}" column — persisting status only`
+      );
+      ({ error: updateErr } = await runUpdate({ status }));
+    }
 
     if (updateErr) {
       console.error('[update-status] update error:', updateErr);
@@ -97,7 +123,7 @@ export async function POST(request) {
         if (shop?.whatsapp_notifications_enabled !== false && shop?.name) {
           const bwRate = shop.bw_rate || 2;
           const colorRate = shop.color_rate || 10;
-          const price = calculatePrice(job.page_count, job.config || {}, bwRate, colorRate);
+          const price = calculatePrice(job.page_count ?? job.pages ?? 1, job.config || {}, bwRate, colorRate);
 
           const msg = buildCompletedMessage({
             customerName: job.customer_name || 'Customer',

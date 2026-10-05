@@ -1,6 +1,11 @@
 import { NextResponse } from 'next/server';
 import { supabaseAdmin, isSupabaseAdminConfigured } from '../../../../lib/supabaseAdmin';
 
+// This route reads the request's Authorization header (CRON_SECRET) and must
+// query Supabase at request time. Without this, `next build` attempts to
+// pre-render it as a static route and fails.
+export const dynamic = 'force-dynamic';
+
 /**
  * GET /api/cron/cleanup — 24-hour file auto-cleanup cron job.
  *

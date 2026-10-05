@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { supabaseAdmin, isSupabaseAdminConfigured as isSupabaseConfigured } from '../../../../lib/supabaseAdmin';
+import { selectStrict } from '../../../../lib/supabaseSelect';
 import {
   sendWhatsAppMessage,
   buildSubmissionMessage,
@@ -89,11 +90,20 @@ export async function POST(request) {
     }
 
     /* ---- Fetch the job ---- */
-    const { data: job, error: jobErr } = await supabaseAdmin
-      .from('print_jobs')
-      .select('id, token_number, customer_name, customer_phone, page_count, config, final_price, status, shop_id')
-      .eq('id', jobId)
-      .single();
+    // page_count / final_price are absent on some print_jobs schemas; a single
+    // missing column makes PostgREST reject the whole select, which silently
+    // turned notifications into 404s. selectStrict degrades gracefully.
+    const { data: job, error: jobErr } = await selectStrict(
+      (cols) =>
+        supabaseAdmin
+          .from('print_jobs')
+          .select(cols)
+          .eq('id', jobId)
+          .single(),
+      'id, token_number, customer_name, customer_phone, page_count, pages, config, final_price, status, shop_id',
+      'id, token_number, customer_name, customer_phone, pages, status, shop_id',
+      'print_jobs:notify'
+    );
 
     if (jobErr || !job) {
       return NextResponse.json({ success: false, error: 'Job not found' }, { status: 404 });
@@ -135,7 +145,7 @@ export async function POST(request) {
 
     /* ---- Build + send ---- */
     const meta = {
-      pageCount: job.page_count,
+      pageCount: job.page_count ?? job.pages ?? null,
       totalPrice: job.final_price,
     };
     const message = EVENTS[event].build({

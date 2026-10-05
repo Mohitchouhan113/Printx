@@ -1027,7 +1027,12 @@ export default function ShopUploadPage({ params }) {
       const data = await res.json();
 
       if (!res.ok || !data.success) {
-        throw new Error(data.error || 'Upload failed');
+        // STRICT MODE: the order was NOT persisted (DB insert failed, shop
+        // suspended, bucket rejected, …). Never continue to the success
+        // screen with a token that exists in no database row — tell the
+        // customer the placement failed so they can retry or pay at the
+        // counter instead of waiting forever for a print that never queued.
+        throw new Error(data.error || 'Order placement failed, please try again.');
       }
 
       // Cross-tab instant notification — the vendor dashboard in another tab
@@ -1120,7 +1125,7 @@ export default function ShopUploadPage({ params }) {
     try {
       await submitOrder(chosenPayment);
     } catch (err) {
-      setSubmitError(err?.message || 'Something went wrong. Please try again.');
+      setSubmitError(err?.message || 'Order placement failed, please try again.');
     }
   };
 
@@ -1528,7 +1533,7 @@ export default function ShopUploadPage({ params }) {
               jobId={jobId}
               tokenNumber={token}
               shopSlug={slug}
-              demo
+              shopId={shop?.id || undefined}
             />
           </div>
 
