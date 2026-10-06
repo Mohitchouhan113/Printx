@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import QRCode from 'qrcode';
 import { jsPDF } from 'jspdf';
 import { supabaseAdmin } from '../../../lib/supabaseAdmin';
+import { getShopActivePlan } from '../../../lib/getShopActivePlan';
 
 /**
  * GET /api/generate-qr?slug=ramesh-xerox&type=pdf|png
@@ -18,6 +19,17 @@ import { supabaseAdmin } from '../../../lib/supabaseAdmin';
  *
  * Demo mode (no Supabase): falls back to a slug-derived shop name so the
  * generator works locally before the Supabase project exists.
+ *
+ * Server-side feature gate: the generate-qr endpoint produces the QR poster/
+ * sticker that a shop prints and posts at its counter so customers can scan in
+ * and place orders through the WhatsApp/online flow. That marketing asset is
+ * part of the has_custom_poster feature set. Free-tier/lower-tier shops whose
+ * active plan has has_custom_poster === false cannot generate this asset by
+ * calling the endpoint (or the JS fallback) directly — they get 403.
+ *
+ * Shop identity: resolved in-band from shopSlug/slug → shops.id. The plan gate
+ * runs against that resolved shop id so the poster is always tied to the real
+ * owning shop, not a guessed slug.
  */
 
 const BASE_URL = process.env.NEXT_PUBLIC_APP_URL || 'https://printx.qrkraft.in';
@@ -47,13 +59,14 @@ export async function GET(request) {
 
     /* --------------------- Resolve shop --------------------- */
     let shop = null;
+    let resolvedShopId = null;
     if (supabaseAdmin) {
       const { data, error } = await supabaseAdmin
         .from('shops')
-        .select('name, slug, bw_rate, color_rate')
+        .select('id, name, slug, bw_rate, color_rate')
         .eq('slug', slug)
         .single();
-      if (!error && data) shop = data;
+      if (!error && data) { shop = data; resolvedShopId = data.id; }
       // Known demo slugs stay resolvable even without a seeded DB row.
       if (!shop) shop = DEMO_SHOPS[slug] || null;
       if (!shop) {
@@ -65,6 +78,26 @@ export async function GET(request) {
     } else {
       // Demo mode (no Supabase): derive a shop so the generator works locally.
       shop = DEMO_SHOPS[slug] || { name: titleize(slug), slug };
+    }
+
+    /* --------------------- Server-side custom-poster feature gate --------------------- */
+    // The A4 counter poster + QR sticker are the has_custom_poster feature.
+    // Free-tier/lower-tier shops with the flag off cannot generate these by
+    // calling the endpoint directly — they get 403 even though the UI would
+    // already show the lock icon. Demo mode (no Supabase) skips the gate so
+    // local dev/the demo storefront still works.
+    if (resolvedShopId && supabaseAdmin) {
+      try {
+        const activePlan = await getShopActivePlan(resolvedShopId);
+        if (activePlan.has_custom_poster === false) {
+          return NextResponse.json(
+            { success: false, error: 'Custom poster feature is locked for your current plan.' },
+            { status: 403 }
+          );
+        }
+      } catch (gateErr) {
+        console.warn('[generate-qr] plan-gate check failed — allowing request:', gateErr?.message || gateErr);
+      }
     }
 
     const uploadUrl = `${BASE_URL}/s/${slug}`;

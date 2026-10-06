@@ -56,34 +56,44 @@ export async function POST(request) {
     }
 
     /* --------------------- Live mode --------------------- */
-    // Resolve shop
+    // Resolve shop (slug is the caller's tenant handle)
+    if (!shopSlug) {
+      return NextResponse.json(
+        { success: false, error: 'shopSlug is required' },
+        { status: 400 }
+      );
+    }
     const { data: shop, error: shopErr } = await supabaseAdmin
       .from('shops')
       .select('id')
       .eq('slug', shopSlug)
-      .single();
+      .maybeSingle();
 
     if (shopErr || !shop) {
       return NextResponse.json({ success: false, error: 'Shop not found' }, { status: 404 });
     }
 
-    // Look up coupon
+    // Look up coupon — live coupons columns ONLY. The previous list
+    // (discount_type, discount_value, active) plus the shop_id filter don't
+    // exist on this table, so every request 400'd and even valid codes came
+    // back as 404 "Invalid or expired". Coupons are global on this schema;
+    // the response keeps the documented discount_type/discount_value shape.
     const { data: coupon, error: couponErr } = await supabaseAdmin
       .from('coupons')
-      .select('id, code, discount_type, discount_value, max_uses, active')
-      .eq('shop_id', shop.id)
+      .select('id, code, discount_percent, max_uses, used_count, is_active')
       .eq('code', code)
-      .eq('active', true)
-      .single();
+      .eq('is_active', true)
+      .maybeSingle();
 
     if (couponErr || !coupon) {
+      if (couponErr) console.error('[coupons/validate] coupon query failed:', couponErr.message);
       return NextResponse.json(
         { success: false, error: 'Invalid or expired coupon code' },
         { status: 404 }
       );
     }
 
-    // Check max_uses if set
+    // Check max_uses if set (print_jobs.applied_coupon is the live ledger)
     if (coupon.max_uses != null) {
       const { count } = await supabaseAdmin
         .from('print_jobs')
@@ -101,8 +111,10 @@ export async function POST(request) {
       success: true,
       coupon: {
         code: coupon.code,
-        discount_type: coupon.discount_type,
-        discount_value: coupon.discount_value,
+        // Live schema stores a single discount_percent — map it onto the
+        // documented type/value pair the clients render.
+        discount_type: 'percentage',
+        discount_value: coupon.discount_percent,
       },
     });
   } catch (err) {

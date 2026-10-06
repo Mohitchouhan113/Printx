@@ -1,0 +1,34 @@
+{
+  "verdict": "CHANGES_REQUESTED",
+  "findings": [
+    {
+      "id": "analytics-no-server-gate",
+      "severity": "high",
+      "confidence": "confirmed",
+      "summary": "has_analytics is enforced client-side only. The analytics data query goes directly from the browser to Supabase via the anon client with no server-side plan check. Free-plan vendors can read print_jobs by calling Supabase directly.",
+      "action": "Add a server-side check (API route or Supabase RLS policy) that blocks print_jobs queries for shops whose active plan has has_analytics = false."
+    },
+    {
+      "id": "whatsapp-poster-ui-only-gate",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "summary": "has_whatsapp_bot and has_custom_poster only suppress sidebar UI elements. No WhatsApp or custom-poster API route calls getShopActivePlan before serving requests.",
+      "action": "If /api/whatsapp and any poster-generation routes exist, add a getShopActivePlan check and return 403 when the flag is false."
+    },
+    {
+      "id": "replay-guard-degrades-to-allow",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "summary": "Both idempotency checks in subscriptionService.js (wallet_transactions description LIKE scan and subscriptions.payment_id lookup) degrade to 'proceed' on any DB error. A transient Supabase failure during the duplicate-check window lets a replayed callback re-extend a subscription. The wallet_transactions scan is also an unindexed full-table scan.",
+      "action": "Promote subscriptions.payment_id as the primary idempotency key. Only proceed (fail-open) when the DB check itself errors; if the check returns an empty result, that is a new payment and is safe to apply."
+    },
+    {
+      "id": "null-expiry-backdoor-no-audit",
+      "severity": "low",
+      "confidence": "confirmed",
+      "summary": "subscription_expires_at = NULL on a paid plan grants permanent access. This is deliberate but there is no admin UI indicator, no is_admin_granted flag, and no audit log entry to distinguish manual grants from billing-system-issued subscriptions.",
+      "action": "Add an is_admin_granted column or admin UI label so support staff can identify and audit shops with permanent plan access."
+    }
+  ],
+  "reviewDoc": "c:\\Users\\mohit\\OneDrive\\Desktop\\PrintX\\.agents\\tasks\\dynamic-plans-review.md"
+}

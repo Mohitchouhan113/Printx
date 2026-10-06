@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { supabaseAdmin, isSupabaseAdminConfigured as isSupabaseConfigured } from '../../../../lib/supabaseAdmin';
 import { selectStrict } from '../../../../lib/supabaseSelect';
+import { getShopActivePlan } from '../../../../lib/getShopActivePlan';
 import {
   sendWhatsAppMessage,
   buildSubmissionMessage,
@@ -24,6 +25,15 @@ import {
  * Resolves the shop + job from Supabase, honours the shop's
  * whatsapp_notifications_enabled preference, and returns per-message
  * delivery results. Demo mode validates and reports what would send.
+ *
+ * Server-side feature gate: sending outbound WhatsApp messages is gated on
+ * has_whatsapp_bot because the notification channel is part of the same
+ * WhatsApp-bot feature set. Free-tier/lower-tier shops that have the flag off
+ * cannot fire this endpoint directly to send arbitrary WhatsApp messages.
+ *
+ * Shop identity: the job row is tenant-scoped (print_jobs.shop_id). The active
+ * plan check runs against job.shop_id (or body.shopId when present), so the
+ * gate always reflects the real shop that owns the job — never a guessed id.
  */
 
 const EVENTS = {
@@ -110,6 +120,24 @@ export async function POST(request) {
     }
 
     const resolvedShopId = shopId || job.shop_id;
+
+    /* --------------------- Server-side WhatsApp-bot feature gate --------------------- */
+    // Outbound WhatsApp messages (order notifications) are part of the
+    // has_whatsapp_bot feature set. Validate the active plan before sending so
+    // a free-tier shop cannot bypass the UI lock by calling this endpoint
+    // directly with a valid jobId.
+    try {
+      const activePlan = await getShopActivePlan(resolvedShopId);
+      if (activePlan.has_whatsapp_bot === false) {
+        return NextResponse.json(
+          { success: false, error: 'WhatsApp bot feature is locked for your current plan.' },
+          { status: 403 }
+        );
+      }
+    } catch (gateErr) {
+      console.warn('[notifications] plan-gate check failed — allowing request:', gateErr?.message || gateErr);
+    }
+
 
     /* ---- Fetch the shop (name + notification preference) ---- */
     const { data: shop } = await supabaseAdmin

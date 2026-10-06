@@ -32,14 +32,15 @@ export function ShopProvider({ children }) {
       setStatus('signed-out');
       return;
     }
-    // Strict select with progressive column-drop (lib/supabaseSelect): the
-    // full migration-aware list is requested first; columns not yet migrated
-    // (phone, is_accepting_orders, double_sided_rate, …) drop to the
-    // probe-verified live list instead of rejecting the whole query.
+    // Strict select with progressive column-drop (lib/supabaseSelect): PREF
+    // lists only probe-verified live columns. is_accepting_orders was
+    // dropped from it — that column doesn't exist yet, so every resolve
+    // answered 400 and fell back to SAFE (which lost `phone` too). The
+    // header toggle degrades to the live is_open column meanwhile.
     const { data } = await selectStrict(
       (cols) => supabase.from('shops').select(cols).eq('owner_id', user.id).maybeSingle(),
-      'id, owner_id, name, slug, phone, upi_id, status, is_active, is_approved, is_open, is_accepting_orders, subscription_plan, subscription_expires_at, plan_status, payment_status, bw_rate, color_rate, double_sided_rate, rate_bw, rate_color, rate_double, supported_paper_sizes, enable_binding, staple_rate, spiral_rate, softcover_rate, hardcover_rate, whatsapp_notifications_enabled, a4_paper_stock, low_stock_threshold, open_time, close_time, is_verified, created_at',
-      'id, owner_id, name, slug, upi_id, status, is_active, is_approved, is_open, subscription_plan, subscription_expires_at, plan_status, payment_status, bw_rate, color_rate, rate_bw, rate_color, rate_double, supported_paper_sizes, enable_binding, staple_rate, spiral_rate, softcover_rate, hardcover_rate, a4_paper_stock, low_stock_threshold, open_time, close_time, is_verified, created_at',
+      'id, owner_id, name, slug, phone, upi_id, status, is_active, is_approved, is_open, subscription_plan, subscription_expires_at, plan_status, payment_status, bw_rate, color_rate, double_sided_rate, rate_bw, rate_color, rate_double, supported_paper_sizes, enable_binding, staple_rate, spiral_rate, softcover_rate, hardcover_rate, whatsapp_notifications_enabled, a4_paper_stock, low_stock_threshold, open_time, close_time, is_verified, created_at',
+      'id, owner_id, name, slug, phone, upi_id, status, is_active, is_approved, is_open, subscription_plan, subscription_expires_at, plan_status, payment_status, bw_rate, color_rate, rate_bw, rate_color, rate_double, supported_paper_sizes, enable_binding, staple_rate, spiral_rate, softcover_rate, hardcover_rate, a4_paper_stock, low_stock_threshold, open_time, close_time, is_verified, created_at',
       'shops:by-owner'
     );
     if (data?.id) {

@@ -22,7 +22,9 @@ export async function POST(request) {
   try {
     const body = await request.json().catch(() => ({}));
     const amountRupees = parseFloat(body.amountRupees);
-    const shopSlug = String(body.shopSlug || '').trim() || 'demo-shop';
+    // Optional tenant metadata — never invented. An absent slug stays empty
+    // (it only labels the receipt/notes); it must not become 'demo-shop'.
+    const shopSlug = String(body.shopSlug || '').trim();
     const customerName = String(body.customerName || '').trim() || 'Customer';
     const customerPhone = String(body.customerPhone || '').trim();
     const description = String(body.description || 'Print order').slice(0, 200);
@@ -39,7 +41,7 @@ export async function POST(request) {
     /* --------------------- Demo mode (no keys) --------------------- */
     if (!RZP_KEY_ID || !RZP_KEY_SECRET) {
       console.warn(
-        `[create-print-order] DEMO mode — ₹${amountRupees} for "${customerName}" @ ${shopSlug}`
+        `[create-print-order] DEMO mode — ₹${amountRupees} for "${customerName}" @ ${shopSlug || 'unspecified shop'}`
       );
       return NextResponse.json({
         success: true,

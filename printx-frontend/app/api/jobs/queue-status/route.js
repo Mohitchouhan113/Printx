@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
+import { getShopActivePlan } from '../../../../lib/getShopActivePlan';
 
 /**
  * GET /api/jobs/queue-status?jobId=…&shopId=…
@@ -14,6 +15,10 @@ import { createClient } from '@supabase/supabase-js';
  *
  * When Supabase is not configured the endpoint returns `unavailable: true`
  * rather than simulated queue data — status is never faked on the client.
+ *
+ * Server-side feature gate: returns 403 when the resolved shop's active plan
+ * has has_analytics === false, so free-tier vendors cannot bypass the UI lock
+ * by hitting this endpoint (or the Supabase client) directly.
  */
 
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
@@ -63,6 +68,60 @@ export async function GET(request) {
         error: 'Live queue is unavailable right now — ask the counter for your status.',
         updatedAt: new Date().toISOString(),
       });
+    }
+
+    /* --------------------- Resolve shop id (for plan gate) --------------------- */
+    // The job itself is tenant-scoped: once we know jobId OR token+shopId,
+    // job.shop_id is the authoritative shop for this request. Resolve it
+    // early so the analytics feature gate can run against the *real* shop,
+    // not a guessed/slug-derived id.
+    let gateShopId = null;
+    let jobForGate = null;
+    if (jobId && /^[0-9a-f-]{36}$/i.test(jobId)) {
+      const { data } = await supabaseAdmin
+        .from('print_jobs')
+        .select('id, shop_id')
+        .eq('id', jobId)
+        .single();
+      if (data) { jobForGate = data; gateShopId = data.shop_id || null; }
+    }
+    if (!gateShopId && tokenNumber && shopId) {
+      const { data } = await supabaseAdmin
+        .from('print_jobs')
+        .select('id, shop_id')
+        .eq('token_number', tokenNumber)
+        .eq('shop_id', shopId)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .single();
+      if (data) { jobForGate = data; gateShopId = data.shop_id || shopId; }
+    }
+    // slug → shop_id is also authoritative when no job is in play (e.g. a
+    // future/adhoc queue ping that only carries a slug). Prefer the slug path
+    // only when we don't already have a job-backed shop id.
+    if (!gateShopId && shopSlug && supabaseAdmin) {
+      const { data: shopRow } = await supabaseAdmin
+        .from('shops')
+        .select('id')
+        .eq('slug', shopSlug)
+        .maybeSingle();
+      if (shopRow?.id) gateShopId = shopRow.id;
+    }
+    // Best-effort plan gate: only enforce when we can positively identify the
+    // shop. An unresolvable shop id (malformed uuid, missing slug) is treated
+    // as "not our tenant" → allow the downstream 404, never a 403.
+    if (gateShopId) {
+      try {
+        const activePlan = await getShopActivePlan(gateShopId);
+        if (activePlan.has_analytics === false) {
+          return NextResponse.json(
+            { success: false, error: 'Analytics feature is locked for your current plan.' },
+            { status: 403 }
+          );
+        }
+      } catch (gateErr) {
+        console.warn('[queue-status] plan-gate check failed — allowing request:', gateErr?.message || gateErr);
+      }
     }
 
     /* --------------------- Resolve the job --------------------- */

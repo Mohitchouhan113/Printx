@@ -1,88 +1,48 @@
-# Dynamic Plans — Verification Record
+# Dynamic Plans — Iteration 3 Verification
 
-## Build command
-```
-npm run build   # inside printx-frontend/
-```
+## What was fixed (iteration 3, review findings)
 
-## Result
-**Exit code 0 — build succeeded.**
+### Finding 1: Printer quota bypass
+**File:** `printx-frontend/app/vendor/dashboard/printers/page.jsx`
 
-Compiled pages confirmed in output:
-- `/vendor/dashboard/billing` ✅
-- `/vendor/dashboard/analytics` ✅
-- `/vendor/dashboard/printers` ✅
-- `/api/upload` (dynamic, ƒ) ✅
-- `/api/jobs/manual-entry` (dynamic, ƒ) ✅
+`handleSave` for new printers now calls `fetch('/api/printers/add', { method: 'POST', ... })` instead of writing directly via the Supabase browser client. The server-side route (`/api/printers/add`) enforces `max_printers` quota via `getShopActivePlan`, counts existing printers server-side, and returns 403 + `planLimitReached: true` when the limit is reached. The client surfaces the error (with count/max info) via `showToast`. The UI-level guard in `openAdd` is preserved as a fast-path UX check before the API call.
 
-The two pre-existing `DYNAMIC_SERVER_USAGE` log entries (`/api/jobs/queue-status` and `/api/generate-qr`) are unrelated to this change set and were present before implementation.
+### Finding 2: `has_analytics` column missing from `fetchPlans` select
+**File:** `printx-frontend/lib/plansStore.js`
 
----
+`fetchPlans` now selects `has_analytics, has_whatsapp_bot, has_custom_poster, max_printers, max_orders_monthly` in the preferred column list. The fallback column list (used when the DB hasn't been migrated yet) still omits these so legacy schemas still return rows gracefully. PostgREST will now include these fields in the response when the migration has run, making the analytics page DB-path (`planRow.has_analytics !== undefined`) and the printers page DB-path (`planRow.max_printers`) actually work from the DB instead of always falling through to the static `lib/plans.js` fallback.
 
-## Changes implemented
+### Finding 3: Billing page plan cards driven by hardcoded PLAN_ORDER
+**File:** `printx-frontend/components/billing/BillingContent.jsx`
 
-### A. SQL Migration
-`printx-frontend/supabase/migrations/20250115120000_plans_quota_columns.sql`
-- `ALTER TABLE plans ADD COLUMN IF NOT EXISTS` for: `max_printers`, `max_orders_monthly`, `has_whatsapp_bot`, `has_analytics`, `has_custom_poster`
-- Upserts all 5 plan rows with quota values matching `lib/plans.js` exactly (prices: free=0, basic=349, pro=1299, advance=2499, lifetime=1999)
-- Safe to re-run
+The plan card grid is now driven by `dynamicPlans` (DB rows) when available. `PLAN_ORDER` is used only as a static fallback when the DB hasn't responded. The grid's column count adapts dynamically to the number of plans rendered. For plans in the DB that are not in the static `PLANS` catalog (i.e. admin-created custom plans), a generic card is rendered with the DB name, price, and features. For the standard five plans, the full rich card with icon, tagline, badge, and CTA is rendered as before.
 
-### B. `lib/getShopActivePlan.js` (new file)
-- Server-side helper for API routes
-- Reads `shops.subscription_plan`, `subscription_expires_at`, `is_lifetime`
-- Falls back to `'free'` if subscription is expired
-- Reads quota columns from `plans` table keyed by `code`
-- Progressive-drop: null quota columns → `-1` for integers (fail-open/unlimited), `true` for booleans (fail-open/enabled)
-- Static `PLANS` fallback when DB is unreachable
-- Exports `FREE_PLAN_DEFAULTS` constant
+## Build verification
 
-### C. `lib/plans.js` — quota fields added
-Added to every plan object: `max_printers`, `max_orders_monthly`, `has_analytics`, `has_whatsapp_bot`, `has_custom_poster` matching the migration seed values exactly.
+**Command:** `npm run build` from `printx-frontend/`
+**Result:** Exit code 0 — build succeeded
 
-### D. `app/api/upload/route.js` — order quota enforcement
-- Imports `getShopActivePlan` and `PLANS`
-- After subscription check: counts this month's `print_jobs` for the shop
-- Returns HTTP 403 with `planLimitReached: true` if `count >= max_orders_monthly` (unless -1)
-- Wrapped in try/catch — fail-open on any DB error
+Key routes confirmed in build output:
+- `/api/printers/add` ✓ (Dynamic, server-rendered)
+- `/vendor/dashboard/printers` ✓ (Static, 12.6 kB)
+- `/vendor/dashboard/billing` ✓ (Static, 4.3 kB)
+- `/vendor/dashboard/analytics` ✓ (Static, 2.2 kB)
+- `/api/jobs/manual-entry` ✓ (Dynamic)
+- `/api/upload` ✓ (Dynamic)
+- `/api/billing/verify-payment` ✓ (Dynamic)
 
-### E. `app/api/jobs/manual-entry/route.js` — order quota enforcement
-- Same guard as upload route, applied after shop is resolved
-- Fail-open on quota-check errors
+**Pre-existing warnings** (not caused by this iteration):
+- `DYNAMIC_SERVER_USAGE` in `/api/jobs/queue-status` and `/api/generate-qr` — these routes use `request.url` at the top level; pre-existing issue unrelated to this change.
 
-### F. `app/vendor/dashboard/printers/page.jsx` — printer limit UI guard
-- Imports `fetchPlans`, `planIsActive`, `PLANS`, `Lock` icon
-- Fetches active plan limits on mount; falls back to static `PLANS` if DB unavailable
-- "Add New Printer" button: disabled with `Lock` icon when `printerLimitReached`
-- `openAdd()` shows a toast and returns early when limit is reached
-- Shows plan name + upgrade link in the header when limit is reached
+## Commit
 
-### G. `app/vendor/dashboard/analytics/page.jsx` — has_analytics gating
-- Imports `fetchPlans`, `planIsActive`, `PLANS`, `Lock` icon
-- Derives `hasAnalytics` from the shop's active plan (DB → static fallback → fail-open true)
-- When `hasAnalytics === false`: renders upgrade prompt with blurred skeleton cards behind it
-- Upgrade prompt links to `/vendor/dashboard/billing`
+`fix: wire printer insert through server route, add quota columns to fetchPlans, drive billing cards from DB rows`
+SHA: `adf05c9`
 
-### H. `components/layout/VendorShell.jsx` — sidebar feature flag gating
-- Imports `PLANS` and `Lock` icon
-- Adds `featureFlag: 'has_analytics'` to analytics nav item
-- Derives `planFeatureFlags` from static `PLANS` (synchronous, no DB round-trip)
-- Locked nav items: dimmed style + Lock icon overlay; clicking redirects to billing with `?upgrade=` param
-- Does not remove locked items from DOM — layout stays stable
+## Files changed
 
-### I. `components/billing/BillingContent.jsx` — dynamic yearly price
-- Plan cards now compute `dp = getPlanPrice(planId)` once at the map level
-- `billed` string uses DB `original_price` when available instead of hardcoded `plan.yearly`
-- Removed redundant inner `const dp = getPlanPrice(planId)` calls in badge, price, and features JSX blocks
-
-### J. `lib/subscriptionService.js` — auditability comment
-- Added `@since` and explanatory comment on `computeExpiryFromBase` confirming the extension logic is intentional
-
----
-
-## Constraints honoured
-- All new files use `.js` (no `.ts`)
-- `plans` table PK is `code` (not `id`) — all lookups use `.eq('code', planId)`
-- Static `PLANS` catalog kept as fallback; not deleted
-- `subscriptionService.js` extension logic untouched
-- Payment routes (`/api/razorpay/verify`, `/api/razorpay/webhook`) unchanged
-- Progressive-column-drop: null quota → `-1` (integer), `true` (boolean) everywhere
+| File | Change |
+|---|---|
+| `lib/plansStore.js` | Added quota columns to `fetchPlans` preferred select string |
+| `app/vendor/dashboard/printers/page.jsx` | Replaced direct Supabase `insert` with `fetch('/api/printers/add', ...)` |
+| `components/billing/BillingContent.jsx` | Plan card grid now driven by DB row array; `PLAN_ORDER` is static fallback only |

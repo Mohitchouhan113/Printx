@@ -25,6 +25,8 @@ export const dynamic = 'force-dynamic';
  *      (progressive column drop — the column ships in
  *       supabase/migrations/20260928_orders_payment_status.sql; until then
  *       the state is mirrored into the system_settings KV so it persists)
+ *      AND promote orders/print_jobs status 'unpaid' → 'Queued'. This is the
+ *      single gate that lets an unpaid draft reach the vendor queue.
  *   3. allocate/ensure the daily sequential token (orders.token_no) via the
  *      shared nextDailyToken counter
  *   4. notify the vendor dashboard Realtime channel:
@@ -191,10 +193,16 @@ export async function POST(request) {
     );
   }
 
-  /* ---------- 2. Mark payment status ---------- */
+  /* ---------- 2. Mark payment status + promote into the queue ---------- */
   const paymentStatus = utr || paidFlag ? 'PAID' : 'PENDING_VERIFICATION';
 
-  const payload = { payment_status: paymentStatus, payment_method: 'upi_intent' };
+  // THE payment gate: /api/upload created this order as `unpaid` and sent no
+  // vendor broadcast. This is the ONLY place the order is promoted to
+  // `Queued`, and it happens after the UPI app hands the customer back. The
+  // status write is a real UPDATE, so the vendor's postgres_changes listener
+  // refires and the queue moves the card out of its unpaid state; step 4
+  // then sends the explicit PAYMENT_CONFIRMED broadcast (chime + toast).
+  const payload = { payment_status: paymentStatus, payment_method: 'upi_intent', status: 'Queued' };
   let columnDropped = false;
   let lastErr = null;
   let attempt = { ...payload };
@@ -208,8 +216,8 @@ export async function POST(request) {
     lastErr = error;
     if (isMissingColumn(error) && attempt.payment_status !== undefined) {
       // orders.payment_status not migrated yet — keep the rest of the update
-      // (it is a REAL UPDATE, so the vendor's postgres_changes listener still
-      // fires) and persist the state in the KV mirror instead.
+      // (status: 'Queued' is a REAL UPDATE, so the vendor's postgres_changes
+      // listener still fires) and persist the state in the KV mirror instead.
       columnDropped = true;
       delete attempt.payment_status;
       continue;
@@ -223,6 +231,23 @@ export async function POST(request) {
       { success: false, error: lastErr.message || 'Could not update the order.' },
       { status: 500 }
     );
+  }
+
+  // Mirror the promotion onto print_jobs (same row id) — that is the table
+  // the vendor queue actually polls, so without it the card would stay
+  // `unpaid` until the next status action even though orders already says
+  // Queued. Print_jobs.status has no schema drift risk (it is a core column),
+  // so this is a single plain update.
+  try {
+    const { error: pjErr } = await supabaseAdmin
+      .from('print_jobs')
+      .update({ status: 'Queued' })
+      .eq('id', orderId);
+    if (pjErr) {
+      console.warn('[confirm-direct-upi] print_jobs status promote failed:', pjErr.message);
+    }
+  } catch (err) {
+    console.warn('[confirm-direct-upi] print_jobs status promote threw:', err?.message);
   }
 
   if (columnDropped || lastErr) {

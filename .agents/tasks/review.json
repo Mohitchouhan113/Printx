@@ -1,0 +1,13 @@
+{
+  "verdict": "APPROVED",
+  "findings": [
+    {
+      "id": "null-shop-duplicate-replay",
+      "severity": "low",
+      "summary": "Null shop on duplicate replay — wrong date in receipt modal",
+      "detail": "The maybeSingle() shop fetch ignores the error field. A DB error returns data: null, indistinguishable from 'no row'. On a duplicate-replay early-return, computeExpiryFromBase receives null and returns NOW + plan_duration, so the receipt modal shows the wrong renewal date. No data corruption — the shop row is never modified on a duplicate — but the display is misleading.",
+      "action": "Destructure the error field from the shop fetch. Log a warning when non-null. The NOW + plan_duration fallback can remain but should be an explicit logged decision."
+    }
+  ],
+  "reviewDoc": "c:\\Users\\mohit\\OneDrive\\Desktop\\PrintX\\.agents\\tasks\\review.md"
+}

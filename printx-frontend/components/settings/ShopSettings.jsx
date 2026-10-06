@@ -253,6 +253,9 @@ export default function ShopSettings({ initialSlug = null, shop: contextShop = n
     } catch { /* ignore */ }
   };
 
+  const shopIdForApi = (contextShop?.id || form.slug || '').trim();
+
+
   useEffect(() => {
     pollWaStatus();
     const interval = setInterval(pollWaStatus, 5000);
@@ -262,10 +265,15 @@ export default function ShopSettings({ initialSlug = null, shop: contextShop = n
   const startWaGateway = async () => {
     setWaLoading(true);
     try {
-      await fetch('/api/whatsapp/status', { method: 'POST' });
-      // Poll for QR after starting
+      // POST requires shopId in-band for the server-side has_whatsapp_bot gate.
+      await fetch('/api/whatsapp/status', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ shopId: shopIdForApi || undefined }),
+      });
+      // Poll for QR after starting — QR GET also requires shopId for the gate.
       setTimeout(async () => {
-        const res = await fetch('/api/whatsapp/qr');
+        const res = await fetch(`/api/whatsapp/qr?shopId=${encodeURIComponent(shopIdForApi || '')}`);
         const data = await res.json();
         if (data.success && data.raw) {
           setWaQr(data.raw);
@@ -387,7 +395,14 @@ export default function ShopSettings({ initialSlug = null, shop: contextShop = n
     setDownloaded(type);
     // Direct navigation triggers the browser's native download via
     // Content-Disposition: attachment (no fetch/blob needed).
-    window.location.href = `/api/generate-qr?slug=${encodeURIComponent(form.slug)}&type=${type}`;
+    // shopId is required for the server-side has_custom_poster gate; pass the
+    // resolved shop id when available (context shop), otherwise fall back to the
+    // slug so the endpoint can resolve the owning shop itself.
+    const qs = new URLSearchParams();
+    qs.set('slug', form.slug);
+    qs.set('type', type);
+    if (shopIdForApi) qs.set('shopId', shopIdForApi);
+    window.location.href = `/api/generate-qr?${qs.toString()}`;
     // Reset the button state after the navigation settles
     setTimeout(() => setDownloaded(null), 1500);
   };
@@ -1085,6 +1100,7 @@ function BulkPricingCouponsSection({ shopSlug }) {
   ]);
   const [newCoupon, setNewCoupon] = useState({ code: '', discount_type: 'percentage', discount_value: 10 });
   const [tiersSaved, setTiersSaved] = useState(false);
+  const [tiersError, setTiersError] = useState('');
   const [couponError, setCouponError] = useState('');
 
   /* ---- Tiered bulk discount — shops.pricing_tiers (bounded ₹/page ranges) ----
@@ -1098,15 +1114,19 @@ function BulkPricingCouponsSection({ shopSlug }) {
   const [ptSaved, setPtSaved] = useState(false);
   const [ptError, setPtError] = useState('');
 
-  /* ---- Load existing volume_rates from Supabase on mount ---- */
+  /* ---- Load existing volume_rates from Supabase on mount ----
+   * volume_rates may still be a pending migration (like pricing_tiers), so a
+   * raw select 400'd on EVERY mount. selectStrict drops to a live column and
+   * caches the winner for the session (lib/supabaseSelect). */
   useEffect(() => {
     (async () => {
       if (isSupabaseConfigured && supabase && shopSlug) {
-        const { data } = await supabase
-          .from('shops')
-          .select('volume_rates')
-          .eq('slug', shopSlug)
-          .single();
+        const { data } = await selectStrict(
+          (cols) => supabase.from('shops').select(cols).eq('slug', shopSlug).maybeSingle(),
+          'volume_rates',
+          'id',
+          'shops:volume_rates'
+        );
         if (data?.volume_rates && Array.isArray(data.volume_rates) && data.volume_rates.length > 0) {
           setTiers(data.volume_rates);
         }
@@ -1115,15 +1135,17 @@ function BulkPricingCouponsSection({ shopSlug }) {
   }, [shopSlug]);
 
   /* ---- pricing_tiers lives in its own query: the column may not exist ----
-   * yet (migration pending) and a failed select must not break volume_rates. */
+   * yet (migration pending) and a failed select must not break volume_rates.
+   * selectStrict keeps the missing-column answer to once per session. */
   useEffect(() => {
     (async () => {
       if (!(isSupabaseConfigured && supabase && shopSlug)) return;
-      const { data } = await supabase
-        .from('shops')
-        .select('pricing_tiers')
-        .eq('slug', shopSlug)
-        .single();
+      const { data } = await selectStrict(
+        (cols) => supabase.from('shops').select(cols).eq('slug', shopSlug).maybeSingle(),
+        'pricing_tiers',
+        'id',
+        'shops:pricing_tiers'
+      );
       const normalized = normalizePricingTiers(data?.pricing_tiers);
       if (normalized.length > 0) setPtiers(normalized);
     })();
@@ -1214,11 +1236,24 @@ function BulkPricingCouponsSection({ shopSlug }) {
       (t) => Number(t.minPages) > 0 && Number(t.bwRate) > 0 && Number(t.colorRate) > 0
     );
     if (!valid) return;
+    setTiersError('');
     if (isSupabaseConfigured && supabase) {
-      await supabase
+      const { error } = await supabase
         .from('shops')
         .update({ volume_rates: tiers })
         .eq('slug', shopSlug);
+      if (error) {
+        // Missing-column writes used to fail silently while the button still
+        // flashed "Saved!" — surface the real reason instead.
+        const col = (error.message || '').match(/'([\w]+)'\s+column|column\s+"(\w+)"/);
+        const missingCol = col?.[1] || col?.[2];
+        setTiersError(
+          missingCol === 'volume_rates'
+            ? 'volume_rates column missing — run supabase/migrations/20260928_core_features.sql in the Supabase SQL Editor.'
+            : error.message || 'Could not save volume tiers.'
+        );
+        return;
+      }
     }
     setTiersSaved(true);
     setTimeout(() => setTiersSaved(false), 2000);
@@ -1435,6 +1470,9 @@ function BulkPricingCouponsSection({ shopSlug }) {
             {tiersSaved ? 'Saved!' : 'Save Tiers'}
           </motion.button>
         </div>
+        {tiersError && (
+          <p className="mt-2 text-[11px] font-bold text-red-400">{tiersError}</p>
+        )}
       </div>
 
       {/* ---- Promo Code Generator ---- */}

@@ -300,13 +300,14 @@ export default function ShopUploadPage({ params }) {
       }
 
       try {
-        // Strict column list with progressive column-drop (lib/supabaseSelect):
-        // PostgREST rejects a named select when ANY column is missing (42703),
-        // so we request the full migration-aware list first and fall back to
-        // the probe-verified live columns when e.g. `phone`/`pricing_tiers`
-        // haven't been migrated yet. Payload stays ~16 fields instead of *.
-        const SHOP_PREF_COLS = 'id, name, phone, area, status, is_active, is_approved, is_open, is_accepting_orders, pricing_tiers, volume_rates, subscription_expires_at, bw_rate, color_rate, upi_id, supported_paper_sizes, enable_binding, staple_rate, spiral_rate, softcover_rate, hardcover_rate';
-        const SHOP_SAFE_COLS = 'id, name, status, is_active, is_approved, is_open, subscription_expires_at, bw_rate, color_rate, upi_id, supported_paper_sizes, enable_binding, staple_rate, spiral_rate, softcover_rate, hardcover_rate';
+        // Strict column list with progressive column-drop (lib/supabaseSelect).
+        // PREF lists ONLY probe-verified live columns: `area`,
+        // is_accepting_orders, pricing_tiers and volume_rates don't exist yet,
+        // and their presence used to 400 this select on every resolve and drop
+        // the query to SAFE — which also lost `phone` (now added), so the
+        // storefront fell back to preview defaults for the shop's contact.
+        const SHOP_PREF_COLS = 'id, name, phone, status, is_active, is_approved, is_open, subscription_expires_at, bw_rate, color_rate, upi_id, supported_paper_sizes, enable_binding, staple_rate, spiral_rate, softcover_rate, hardcover_rate';
+        const SHOP_SAFE_COLS = 'id, name, phone, status, is_active, is_approved, is_open, subscription_expires_at, bw_rate, color_rate, upi_id, supported_paper_sizes, enable_binding, staple_rate, spiral_rate, softcover_rate, hardcover_rate';
         const fetchShop = async (targetSlug) => {
           const { data, error } = await selectStrict(
             (cols) => supabase.from('shops').select(cols).eq('slug', targetSlug).maybeSingle(),

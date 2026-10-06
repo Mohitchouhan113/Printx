@@ -86,7 +86,10 @@ export default function LiveOrdersPage() {
         </p>
       </div>
 
-      <LiveQueueTable shopId={shopId || 'demo-shop'} initialOrders={[]} />
+      {/* shopId is null while resolving (or when this account owns no shop —
+          handled by the Shop Not Found branch above). No 'demo-shop'
+          sentinel: a fake id would only ever produce 400/404 queries. */}
+      <LiveQueueTable shopId={shopId} initialOrders={[]} />
     </div>
   );
 }

@@ -12,6 +12,7 @@ import {
   Hourglass,
 } from 'lucide-react';
 import { supabase, isSupabaseConfigured } from '../../lib/supabaseClient';
+import { onAudioUnlock } from '../../lib/audioUnlock';
 
 /**
  * QueueTrackerCard — live queue position + ETA for the customer token screen.
@@ -34,7 +35,10 @@ const POLL_INTERVAL_MS = 15000; // fallback poll when no realtime event fires
 export default function QueueTrackerCard({
   jobId,
   tokenNumber,
-  shopId = 'demo-shop',
+  // No demo fallback: an unresolved shop id must not become a literal
+  // `shop_id=eq.demo-shop` realtime filter (PostgREST answers 400 because
+  // demo-shop isn't a uuid). Callers pass the real id; until then we poll.
+  shopId = null,
   shopSlug,
 }) {
   const [state, setState] = useState({
@@ -81,6 +85,24 @@ export default function QueueTrackerCard({
     }
   }, [beeped]);
 
+  /* ctx.resume() outside a user gesture is silently ignored, so the
+   * ready-chime could fire into a suspended context. Warm it up on the
+   * session's first interaction instead (see lib/audioUnlock). */
+  const unlockAudio = useCallback(() => {
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      if (!audioCtxRef.current || audioCtxRef.current.state === 'closed') {
+        audioCtxRef.current = new Ctx();
+      }
+      if (audioCtxRef.current.state === 'suspended') audioCtxRef.current.resume();
+    } catch {
+      /* audio unavailable — never block the UI */
+    }
+  }, []);
+
+  useEffect(() => onAudioUnlock(unlockAudio), [unlockAudio]);
+
   /* ------------------------- Fetch queue status ------------------------- */
   const fetchStatus = useCallback(async () => {
     try {
@@ -88,7 +110,12 @@ export default function QueueTrackerCard({
       if (jobId) params.set('jobId', jobId);
       if (tokenNumber) params.set('token', tokenNumber);
       if (shopId) params.set('shopId', shopId);
-      if (shopSlug) params.set('shopSlug', shopSlug);
+      // Required for the server-side has_analytics plan gate — the endpoint now
+      // resolves the owning shop from job.shop_id, so without a resolved shop id
+      // the gate cannot positively identify the tenant and falls through to the
+      // downstream 404 (never a 403). Omitting this would silently break queue
+      // status for shops whose plan has has_analytics === false.
+      if (!shopId && shopSlug) params.set('shopSlug', shopSlug);
 
       const res = await fetch(`/api/jobs/queue-status?${params.toString()}`);
       const data = await res.json();
@@ -109,7 +136,7 @@ export default function QueueTrackerCard({
     } catch {
       /* network hiccup — keep last known state */
     }
-  }, [jobId, tokenNumber, shopId]);
+  }, [jobId, tokenNumber, shopId, shopSlug]);
 
   /* ------------------------- Initial fetch ------------------------- */
   useEffect(() => {
@@ -124,34 +151,39 @@ export default function QueueTrackerCard({
       return;
     }
 
-    // Live mode — subscribe to any change on this shop's print_jobs
-    const channel = supabase
-      .channel(`queue-tracker-${shopId}`)
-      .on(
-        'postgres_changes',
-        {
-          event: '*',
-          schema: 'public',
-          table: 'print_jobs',
-          filter: `shop_id=eq.${shopId}`,
-        },
-        () => {
-          // Any insert/update/deletion on the shop queue → recalculate
-          fetchStatus();
-        }
-      )
-      .subscribe((status) => {
-        setState((prev) => ({ ...prev, live: status === 'SUBSCRIBED' }));
-      });
+    // Live mode — subscribe to any change on this shop's print_jobs. Without
+    // a resolved shop id there is no valid filter, so we keep the fallback
+    // poll below running instead of emitting a 400-ing eq.null filter.
+    const channel = shopId
+      ? supabase
+          .channel(`queue-tracker-${shopId}`)
+          .on(
+            'postgres_changes',
+            {
+              event: '*',
+              schema: 'public',
+              table: 'print_jobs',
+              filter: `shop_id=eq.${shopId}`,
+            },
+            () => {
+              // Any insert/update/deletion on the shop queue → recalculate
+              fetchStatus();
+            }
+          )
+          .subscribe((status) => {
+            setState((prev) => ({ ...prev, live: status === 'SUBSCRIBED' }));
+          })
+      : null;
 
     channelRef.current = channel;
+    if (!channel) setState((prev) => ({ ...prev, live: false }));
 
     // Fallback poll in case realtime events are missed
     const poll = setInterval(fetchStatus, POLL_INTERVAL_MS);
 
     return () => {
       try {
-        supabase.removeChannel(channel);
+        if (channel) supabase.removeChannel(channel);
       } catch { /* noop */ }
       clearInterval(poll);
     };

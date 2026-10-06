@@ -102,9 +102,10 @@ export default function DashboardOverview() {
    * auto-provision, no demo sentinel. A logged-in user whose account has no
    * shop row gets a clean "Shop Not Found" empty state instead of another
    * business's data. When Supabase env vars are absent the dashboard runs in
-   * demo mode ('demo-shop' sentinel) purely for offline UI exploration.
+   * demo mode with shopId null purely for offline UI exploration — no query
+   * is possible then, so no 'demo-shop' sentinel is needed.
    */
-  const [shopId, setShopId] = useState(isSupabaseConfigured ? null : 'demo-shop');
+  const [shopId, setShopId] = useState(null);
   const [shopError, setShopError] = useState(null);
   /* Live shop row — its name drives the "Welcome, [Shop]!" banner */
   const [shop, setShop] = useState(null);

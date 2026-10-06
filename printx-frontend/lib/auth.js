@@ -95,7 +95,7 @@ const AuthContext = createContext({
   loading: false,
 });
 
-export function AuthProvider({ children, shopId = 'demo-shop' }) {
+export function AuthProvider({ children, shopId = null }) {
   const [role, setRoleState] = useState(ROLES.OWNER);
   const [loading, setLoading] = useState(true);
 
@@ -107,7 +107,10 @@ export function AuthProvider({ children, shopId = 'demo-shop' }) {
       if (isSupabaseConfigured && supabase) {
         try {
           const { data: { user } } = await supabase.auth.getUser();
-          if (cancelled || !user) {
+          // Without a resolved shop id there's nothing valid to filter by —
+          // the old 'demo-shop' default fired a query PostgREST can only
+          // reject (400 non-uuid / 404 missing table).
+          if (cancelled || !user || !shopId) {
             setRoleState(getStoredRole());
           } else {
             // Fetch role from shops_members or user profile

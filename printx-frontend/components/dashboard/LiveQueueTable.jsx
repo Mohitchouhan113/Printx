@@ -24,6 +24,7 @@ import useShopQueue from '../../hooks/useShopQueue';
 import { getBinding, getPaperMeta } from '../../lib/pricing';
 import { isPriorityRow } from '../../lib/priority';
 import { speakOrderAlert, primeVoices } from '../../lib/voiceAlert';
+import { onAudioUnlock } from '../../lib/audioUnlock';
 import OrderPreviewModal from './OrderPreviewModal';
 
 /**
@@ -43,7 +44,7 @@ import OrderPreviewModal from './OrderPreviewModal';
 
 const STATUS_FLOW = ['PENDING', 'PRINTING', 'COMPLETED'];
 
-export default function LiveQueueTable({ shopId = 'demo-shop', initialOrders = [], onNewOrder, onOrdersChange, autoPrint = false }) {
+export default function LiveQueueTable({ shopId = null, initialOrders = [], onNewOrder, onOrdersChange, autoPrint = false }) {
   const [orders, setOrders] = useState(initialOrders);
   const [muted, setMuted] = useState(false);
   /* 📢 Counter Soundbox — Paytm-style voice alert on orders INSERT.
@@ -134,6 +135,12 @@ export default function LiveQueueTable({ shopId = 'demo-shop', initialOrders = [
       return null;
     }
   }, []);
+
+  /* ctx.resume() outside a user gesture is silently ignored by browsers, so
+   * an order chime arriving before the vendor ever interacted with the page
+   * would play nothing. Warm the context up on the FIRST interaction of the
+   * session (see lib/audioUnlock) instead of waiting for the first chime. */
+  useEffect(() => onAudioUnlock(ensureCtx), [ensureCtx]);
 
   /** Fire a tone sequence: [freqHz, startOffsetSec, durSec] */
   const playTones = useCallback(
@@ -388,6 +395,15 @@ export default function LiveQueueTable({ shopId = 'demo-shop', initialOrders = [
 
     const upsertJob = (job) =>
       setOrders((prev) => {
+        // payload.new.status is checked on EVERY event: a row that lands (or
+        // flips) in a terminal state leaves the active queue immediately
+        // instead of being prepended/re-rendered alongside live work. The 1s
+        // poll may carry the row back into `orders` for the history counters,
+        // but `activeOrders` below keeps it out of the rendered queue.
+        if (isTerminalStatus(job?.status)) {
+          if (!prev.some((o) => o.id === job.id)) return prev;
+          return prev.filter((o) => o.id !== job.id);
+        }
         const idx = prev.findIndex((o) => o.id === job.id);
         if (idx === -1) return [normalizeJob(mergeBinding(job)), ...prev]; // new job → prepend
         const next = [...prev];
@@ -424,6 +440,10 @@ export default function LiveQueueTable({ shopId = 'demo-shop', initialOrders = [
             created_at: row.created_at || new Date().toISOString(),
           });
           return [sidecarJob, ...prev];
+        }
+        // Terminal status mirrored on the sidecar → drop from the active queue
+        if (isTerminalStatus(row.status)) {
+          return prev.filter((o) => o.id !== row.id);
         }
         return prev.map((o) =>
           o.id === row.id
@@ -843,14 +863,24 @@ export default function LiveQueueTable({ shopId = 'demo-shop', initialOrders = [
 
   /* -------------------- Derived -------------------- */
 
-  /* ------------------- Derived ------------------- */
+  /* Active queue: Completed / Cancelled / Purged rows are finished with the
+   * counter and must NOT render alongside live work (the history view lives
+   * on the Orders page). `orders` keeps them so the "N done" counter and the
+   * parent's stats still see recent history. */
+  const activeOrders = useMemo(
+    () => orders.filter((o) => !isTerminalStatus(o.status)),
+    [orders]
+  );
+
   const counts = useMemo(
     () => ({
-      live: orders.filter((o) => !['COMPLETED', 'CANCELLED'].includes(o.status)).length,
+      // Unpaid rows stay counted: the vendor must see them at the counter to
+      // take manual payment (StatusPill labels them "Awaiting payment").
+      live: activeOrders.length,
       completed: orders.filter((o) => o.status === 'COMPLETED').length,
-      cancelled: orders.filter((o) => o.status === 'CANCELLED').length,
+      cancelled: orders.filter((o) => ['CANCELLED', 'PURGED'].includes(o.status)).length,
     }),
-    [orders]
+    [activeOrders, orders]
   );
 
   /* Report the live rows up to the parent so dashboard stats derive from
@@ -860,14 +890,13 @@ export default function LiveQueueTable({ shopId = 'demo-shop', initialOrders = [
   }, [orders, onOrdersChange]);
 
   /* ⚡ Priority Express — active RUSH orders float to the very top of the
-   * queue so the counter never sits on a paid express job. Completed and
-   * cancelled rows keep their natural newest-first position (Array.sort is
-   * stable, so everything else stays in created_at order). */
+   * queue so the counter never sits on a paid express job (Array.sort is
+   * stable, so everything else keeps its created_at order). Terminal rows
+   * never reach here — activeOrders already filtered them. */
   const sortedOrders = useMemo(() => {
-    const terminal = (o) => ['COMPLETED', 'CANCELLED'].includes(String(o.status || '').toUpperCase());
-    const rank = (o) => (isPriorityRow(o) && !terminal(o) ? 0 : 1);
-    return [...orders].sort((a, b) => rank(a) - rank(b));
-  }, [orders]);
+    const rank = (o) => (isPriorityRow(o) ? 0 : 1);
+    return [...activeOrders].sort((a, b) => rank(a) - rank(b));
+  }, [activeOrders]);
 
   /* Broadcast the active-queue count so the shared sidebar badge stays in
    * sync from any page that renders the queue (Overview, Orders, …). */
@@ -1053,7 +1082,7 @@ export default function LiveQueueTable({ shopId = 'demo-shop', initialOrders = [
 
           {sortedOrders.map((order, idx) => {
             const busy = busyId === order.id;
-            const terminal = ['COMPLETED', 'CANCELLED'].includes(order.status);
+            const terminal = isTerminalStatus(order.status);
             const rush = isPriorityRow(order);
             /* ONE canonical token badge: the daily integer from orders.token_no.
              * Rows created before the daily system only carry the legacy
@@ -1270,11 +1299,20 @@ export default function LiveQueueTable({ shopId = 'demo-shop', initialOrders = [
 function StatusPill({ status }) {
   const map = {
     PENDING: 'bg-amber-500/15 text-amber-400 border-amber-500/30 shadow-[0_0_10px_rgba(245,158,11,0.25)]',
+    UNPAID: 'bg-orange-500/15 text-orange-400 border-orange-500/40 shadow-[0_0_10px_rgba(249,115,22,0.25)]',
+    PENDING_VERIFICATION: 'bg-orange-500/15 text-orange-400 border-orange-500/40 shadow-[0_0_10px_rgba(249,115,22,0.25)]',
     PRINTING: 'bg-[#06B6D4]/15 text-[#06B6D4] border-[#06B6D4]/30 shadow-[0_0_10px_rgba(6,182,212,0.25)]',
     COMPLETED: 'bg-[#10B981]/15 text-[#10B981] border-[#10B981]/30 shadow-[0_0_10px_rgba(16,185,129,0.25)]',
     CANCELLED: 'bg-[#DC2626]/15 text-[#DC2626] border-[#DC2626]/30',
   };
-  const labels = { PENDING: 'Pending', PRINTING: 'Printing', COMPLETED: 'Completed', CANCELLED: 'Cancelled' };
+  const labels = {
+    PENDING: 'Pending',
+    UNPAID: 'Awaiting payment',
+    PENDING_VERIFICATION: 'Awaiting payment',
+    PRINTING: 'Printing',
+    COMPLETED: 'Completed',
+    CANCELLED: 'Cancelled',
+  };
   return (
     <span className={`inline-flex items-center font-semibold text-xs px-2.5 py-1 rounded-full border flex-shrink-0 ${map[status] || map.PENDING}`}>
       {labels[status] || status}
@@ -1325,6 +1363,24 @@ function canonStatus(s) {
   if (v === 'QUEUED') return 'PENDING';
   return v;
 }
+
+/**
+ * Terminal statuses — orders that are finished with the active queue.
+ *
+ * Completed / Cancelled / Purged are filtered out of the active queue UI
+ * state (see `activeOrders` below) instead of being rendered alongside live
+ * work, and an UPDATE that flips a row to one of these REMOVES it rather than
+ * re-prepending it, which is what previously produced duplicate / re-rendering
+ * order state when the realtime listener and the 1s poll both fed the row.
+ */
+const TERMINAL_STATUSES = new Set(['COMPLETED', 'CANCELLED', 'PURGED']);
+const isTerminalStatus = (s) => TERMINAL_STATUSES.has(canonStatus(s));
+
+/** Statuses that mean "payment has not been verified yet". */
+const isUnpaidStatus = (s) => {
+  const v = canonStatus(s);
+  return v === 'UNPAID' || v === 'PENDING_VERIFICATION';
+};
 
 function normalizeJob(job = {}) {
   // Binding can arrive as a dedicated column or inside config jsonb

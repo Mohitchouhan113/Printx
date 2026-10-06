@@ -14,6 +14,7 @@ import {
   AlertCircle,
   Check,
 } from 'lucide-react';
+import { onAudioUnlock } from '../../../lib/audioUnlock';
 
 /**
  * LiveOrdersTable
@@ -62,6 +63,38 @@ export default function LiveOrdersTable({ orders: propOrders, compact = false, o
       // no-op
     }
   }, []);
+
+  /* Autoplay policy: HTMLAudio.play() is rejected until the user has
+   * interacted with the page, so the first new-order chime of a session was
+   * swallowed. Unlock the element (silently, volume 0 → pause) on the first
+   * interaction so later play() calls succeed (see lib/audioUnlock). */
+  useEffect(
+    () =>
+      onAudioUnlock(() => {
+        try {
+          if (!audioRef.current) {
+            audioRef.current = new Audio(
+              'data:audio/wav;base64,UklGRl9vT19XQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YU'
+            );
+          }
+          const el = audioRef.current;
+          const volume = el.volume;
+          el.volume = 0;
+          el.play()
+            .then(() => {
+              el.pause();
+              el.currentTime = 0;
+              el.volume = volume;
+            })
+            .catch(() => {
+              el.volume = volume;
+            });
+        } catch {
+          /* audio unavailable — never block the UI */
+        }
+      }),
+    []
+  );
 
   // WebSocket connection + listeners
   useEffect(() => {
