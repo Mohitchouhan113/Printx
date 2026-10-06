@@ -16,11 +16,14 @@ import {
   Loader2,
   Store,
   Inbox,
+  Lock,
 } from 'lucide-react';
 import { useShop } from '../../../../components/ShopContext';
 import { useRequireAuth } from '../../../../lib/useRequireAuth';
 import { supabase, isSupabaseConfigured } from '../../../../lib/supabaseClient';
 import { selectStrict } from '../../../../lib/supabaseSelect';
+import { fetchPlans, planIsActive } from '../../../../lib/plansStore';
+import { PLANS } from '../../../../lib/plans';
 
 /**
  * Shop Analytics & Revenue Dashboard — REAL DATA ONLY.
@@ -45,6 +48,30 @@ export default function AnalyticsPage() {
   const [jobs, setJobs] = useState([]);
   const [loading, setLoading] = useState(true);
 
+  // Feature gating: has_analytics from the active plan (fail-open = true)
+  const [hasAnalytics, setHasAnalytics] = useState(true);
+
+  /* ---- Determine has_analytics from the shop's active plan ---- */
+  useEffect(() => {
+    if (!shop?.subscription_plan) return;
+    (async () => {
+      try {
+        const { data, error } = await fetchPlans();
+        if (!error && data && data.length > 0) {
+          const active = data.filter(planIsActive);
+          const planRow = active.find((p) => p.code === (shop.subscription_plan || 'free'));
+          if (planRow && planRow.has_analytics !== undefined && planRow.has_analytics !== null) {
+            setHasAnalytics(Boolean(planRow.has_analytics));
+            return;
+          }
+        }
+      } catch { /* fall through to static fallback */ }
+      // Static fallback — fail-open (true) if column absent
+      const staticPlan = PLANS[shop.subscription_plan || 'free'] || PLANS.free;
+      setHasAnalytics(staticPlan.has_analytics ?? true);
+    })();
+  }, [shop?.subscription_plan]);
+
   /* ---------- Fetch real print_jobs for THIS shop in the selected range ---------- */
   const fetchJobs = useCallback(async () => {
     if (!isSupabaseConfigured || !supabase || !shop?.id) {
@@ -58,10 +85,12 @@ export default function AnalyticsPage() {
     since.setHours(0, 0, 0, 0);
     since.setDate(since.getDate() - (days - 1));
 
-    // Strict column list with progressive column-drop: the full set the
-    // metric math reads (config/total_price/completed_at/… land with future
-    // migrations) with a probe-verified live fallback so the charts never
-    // break — no more select('*').
+    // Strict column list with progressive drop. PREF contains ONLY columns
+    // verified on the live print_jobs schema — an earlier list speculated
+    // about pending migrations (page_count, color_mode, completed_at,
+    // updated_at, total_price …), PostgREST answered 400 for every poll, and
+    // selectStrict silently dropped to SAFE — which omitted config and
+    // final_price, so revenue and colour breakdowns rendered as zero.
     const { data, error } = await selectStrict(
       (cols) =>
         supabase
@@ -71,8 +100,8 @@ export default function AnalyticsPage() {
           .gte('created_at', since.toISOString())
           .order('created_at', { ascending: false })
           .limit(1000),
-      'id, shop_id, token_number, customer_name, customer_phone, file_name, file_url, pages, page_count, copies, color_option, color_mode, mode, color, config, status, created_at, completed_at, updated_at, total_price, final_price',
-      'id, shop_id, token_number, customer_name, customer_phone, file_name, file_url, pages, copies, color_option, status, created_at',
+      'id, shop_id, token_number, customer_name, customer_phone, file_name, file_url, pages, copies, color_option, config, status, created_at, final_price',
+      'id, shop_id, token_number, customer_name, customer_phone, file_name, file_url, pages, copies, color_option, config, status, created_at, final_price',
       'print_jobs:analytics'
     );
 
@@ -203,6 +232,52 @@ export default function AnalyticsPage() {
           <Store className="w-4 h-4" />
           Register Your Shop
         </a>
+      </div>
+    );
+  }
+
+  /* ---------- Analytics feature-gate — plan doesn't include analytics ---------- */
+  if (!hasAnalytics) {
+    return (
+      <div className="space-y-6">
+        {/* Header skeleton */}
+        <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-4">
+          <div>
+            <h1 className="text-3xl font-black text-white tracking-tight">Shop Analytics</h1>
+            <p className="text-slate-400 text-sm mt-1.5">
+              {shop?.name ? `${shop.name} — ` : ''}Revenue, orders &amp; fleet performance
+            </p>
+          </div>
+        </div>
+        {/* Blurred placeholder + upgrade overlay */}
+        <div className="relative">
+          {/* Skeleton stat cards behind the overlay */}
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 filter blur-sm pointer-events-none select-none" aria-hidden="true">
+            {['Total Revenue', 'Pages Printed', 'Orders Completed', 'Avg Speed'].map((label) => (
+              <div key={label} className="rounded-2xl bg-[#1E293B] border border-[#1E2D4A] p-4 h-24 animate-pulse" />
+            ))}
+          </div>
+          {/* Upgrade prompt */}
+          <div className="absolute inset-0 flex items-center justify-center">
+            <div className="rounded-2xl border border-[#1E2D4A] bg-[#0B132B]/95 backdrop-blur-md p-8 text-center max-w-sm mx-4 shadow-2xl">
+              <div className="mx-auto w-14 h-14 rounded-2xl bg-cyan-500/12 border border-cyan-500/30 flex items-center justify-center mb-4">
+                <Lock className="w-7 h-7 text-cyan-300" />
+              </div>
+              <h2 className="text-lg font-black text-white">Analytics Locked</h2>
+              <p className="mt-2 text-sm text-slate-400">
+                Analytics are available on the <strong className="text-white">Basic</strong> plan and above.
+                Upgrade to unlock revenue insights, peak hour charts, and export reports.
+              </p>
+              <a
+                href="/vendor/dashboard/billing"
+                className="mt-5 inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-gradient-to-r from-cyan-500 to-blue-600 text-white text-sm font-black shadow-[0_0_20px_rgba(6,182,212,0.3)] hover:brightness-110 transition"
+              >
+                <TrendingUp className="w-4 h-4" />
+                Upgrade Plan
+              </a>
+            </div>
+          </div>
+        </div>
       </div>
     );
   }

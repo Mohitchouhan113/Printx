@@ -337,14 +337,23 @@ export default function BillingContent({ shop = null, shopId = null, shopSlug = 
           const ui = PLAN_UI[planId];
           const isCurrent = planId === currentPlan;
           const isBusy = busyPlan === planId;
-          const rate = planId === 'lifetime' ? plan.lifetime : isYearly ? Math.round(plan.yearly / 12) : plan.monthly;
+          const dp = getPlanPrice(planId);
+          const hasOffer = dp.offer != null && dp.offer < dp.original;
+          // Dynamic monthly rate: use DB offer price when available
+          const rate = planId === 'lifetime'
+            ? (dp.original || plan.lifetime)
+            : isYearly
+              ? Math.round((dp.original || plan.yearly) / 12)
+              : (hasOffer ? dp.offer : (dp.monthly || plan.monthly));
+          // Dynamic yearly billed string: use DB original_price when available
+          const yearlyTotal = dp.original || plan.yearly;
           const billed =
             planId === 'lifetime'
               ? 'One-time · never expires'
               : rate === 0
                 ? 'Free forever'
                 : isYearly
-                  ? `Billed ₹${plan.yearly.toLocaleString('en-IN')}/year`
+                  ? `Billed ₹${yearlyTotal.toLocaleString('en-IN')}/year`
                   : 'Billed monthly';
 
           return (
@@ -366,7 +375,6 @@ export default function BillingContent({ shop = null, shopId = null, shopSlug = 
             >
               {/* Dynamic Badge from DB */}
               {(() => {
-                const dp = getPlanPrice(planId);
                 return dp.badge ? (
                   <div className="absolute -top-3 left-1/2 -translate-x-1/2 flex items-center gap-1 px-3 py-1 rounded-full bg-gradient-to-r from-amber-500 to-orange-500 text-white text-[10px] font-extrabold uppercase tracking-wider shadow-[0_0_15px_rgba(245,158,11,0.5)]">
                     <Gift className="w-3 h-3" />
@@ -393,16 +401,15 @@ export default function BillingContent({ shop = null, shopId = null, shopSlug = 
 
               {/* Price — dynamic offer price from DB with strikethrough */}
               {(() => {
-                const dp = getPlanPrice(planId);
-                const hasOffer = dp.offer != null && dp.offer < dp.original;
-                const displayRate = planId === 'lifetime' ? (dp.original || plan.lifetime) : (hasOffer ? dp.offer : rate);
+                const hasOfferLocal = dp.offer != null && dp.offer < dp.original;
+                const displayRate = planId === 'lifetime' ? (dp.original || plan.lifetime) : (hasOfferLocal ? dp.offer : rate);
                 return (
                   <div>
                     <div className="flex items-baseline gap-2">
-                      <span className={`text-2xl font-black tracking-tight ${hasOffer ? 'text-emerald-400' : 'text-white'}`}>
+                      <span className={`text-2xl font-black tracking-tight ${hasOfferLocal ? 'text-emerald-400' : 'text-white'}`}>
                         ₹{displayRate.toLocaleString('en-IN')}
                       </span>
-                      {hasOffer && (
+                      {hasOfferLocal && (
                         <span className="text-sm text-slate-500 line-through">₹{dp.original.toLocaleString('en-IN')}</span>
                       )}
                       <span className="text-xs text-slate-500">
@@ -417,7 +424,6 @@ export default function BillingContent({ shop = null, shopId = null, shopSlug = 
               {/* Features — use DB features if available, else hardcoded */}
               <ul className="space-y-2.5 flex-1 mb-5">
                 {(() => {
-                  const dp = getPlanPrice(planId);
                   const features = dp.dbFeatures || plan.features;
                   return features.map((f, fi) => (
                     <li key={fi} className="flex items-start gap-2 text-xs text-slate-300">

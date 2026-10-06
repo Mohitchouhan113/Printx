@@ -23,9 +23,12 @@ import {
   Copy,
   Shield,
   Zap,
+  Lock,
 } from 'lucide-react';
 import { useShop } from '../../../../components/ShopContext';
 import { supabase, isSupabaseConfigured } from '../../../../lib/supabaseClient';
+import { fetchPlans, planIsActive } from '../../../../lib/plansStore';
+import { PLANS } from '../../../../lib/plans';
 
 /* ========================================================================
  * STATUS STYLES
@@ -76,6 +79,10 @@ export default function PrintersPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [toast, setToast] = useState(null); // { type: 'success'|'error'|'info', msg }
+
+  // Plan-based printer limit (derived from dynamic plans + static fallback)
+  const [maxPrinters, setMaxPrinters] = useState(-1); // -1 = unlimited
+  const [activePlanName, setActivePlanName] = useState('');
 
   // Modal state
   const [showModal, setShowModal] = useState(false);
@@ -134,8 +141,41 @@ export default function PrintersPage() {
     fetchPrinters();
   }, [fetchPrinters]);
 
+  /* ---- Fetch active plan limits for printer quota ---- */
+  useEffect(() => {
+    if (!shop?.subscription_plan) return;
+    (async () => {
+      try {
+        const { data, error } = await fetchPlans();
+        if (!error && data && data.length > 0) {
+          const active = data.filter(planIsActive);
+          const planRow = active.find((p) => p.code === (shop.subscription_plan || 'free'));
+          if (planRow) {
+            const limit = planRow.max_printers ?? -1;
+            setMaxPrinters(limit);
+            setActivePlanName(planRow.name || shop.subscription_plan || 'Free');
+            return;
+          }
+        }
+      } catch { /* fall through to static fallback */ }
+      // Static fallback from lib/plans.js
+      const staticPlan = PLANS[shop.subscription_plan || 'free'] || PLANS.free;
+      setMaxPrinters(staticPlan.max_printers ?? -1);
+      setActivePlanName(staticPlan.name || 'Free');
+    })();
+  }, [shop?.subscription_plan]);
+
   /* -------------------- Add / Edit -------------------- */
   const openAdd = () => {
+    // Check printer limit before opening the modal
+    const printerLimitReached = maxPrinters !== -1 && printers.length >= maxPrinters;
+    if (printerLimitReached) {
+      showToast(
+        'error',
+        `Your ${activePlanName || 'current'} plan supports up to ${maxPrinters} printer${maxPrinters === 1 ? '' : 's'}. Upgrade to add more.`
+      );
+      return;
+    }
     setEditingPrinter(null);
     setForm(EMPTY_FORM);
     setShowModal(true);
@@ -335,13 +375,32 @@ export default function PrintersPage() {
             Manage connected printers, spoolers, and auto-print integration
           </p>
         </div>
-        <button
-          onClick={openAdd}
-          className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-sm font-semibold transition-all shadow-lg shadow-cyan-600/20"
-        >
-          <Plus className="w-4 h-4" />
-          Add New Printer
-        </button>
+        {(() => {
+          const printerLimitReached = maxPrinters !== -1 && printers.length >= maxPrinters;
+          return (
+            <div className="flex flex-col items-end gap-1">
+              <button
+                onClick={openAdd}
+                disabled={printerLimitReached}
+                title={printerLimitReached ? `Your ${activePlanName} plan supports up to ${maxPrinters} printer${maxPrinters === 1 ? '' : 's'}. Upgrade to add more.` : 'Add a new printer'}
+                className={`flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-semibold transition-all shadow-lg ${
+                  printerLimitReached
+                    ? 'bg-slate-700/60 text-slate-400 cursor-not-allowed shadow-none border border-slate-600/40'
+                    : 'bg-cyan-600 hover:bg-cyan-500 text-white shadow-cyan-600/20'
+                }`}
+              >
+                {printerLimitReached ? <Lock className="w-4 h-4" /> : <Plus className="w-4 h-4" />}
+                {printerLimitReached ? 'Printer Limit Reached' : 'Add New Printer'}
+              </button>
+              {printerLimitReached && (
+                <p className="text-[11px] text-amber-400">
+                  {activePlanName} plan: {printers.length}/{maxPrinters} printers —{' '}
+                  <a href="/vendor/dashboard/billing" className="underline hover:text-amber-300">Upgrade</a>
+                </p>
+              )}
+            </div>
+          );
+        })()}
       </div>
 
       {/* ---------- Error Banner ---------- */}

@@ -3,6 +3,7 @@ import { createClient } from '@supabase/supabase-js';
 import { sendWhatsAppFireAndForget, buildWalkInMessage } from '../../../../lib/whatsapp';
 import { nextDailyToken } from '../../../../lib/dailyToken';
 import { priorityWrite, PRIORITY_FEE } from '../../../../lib/priority';
+import { getShopActivePlan } from '../../../../lib/getShopActivePlan';
 
 /**
  * POST /api/jobs/manual-entry
@@ -145,6 +146,36 @@ export async function POST(request) {
 
     if (shopErr || !shop) {
       return NextResponse.json({ success: false, error: 'Shop not found' }, { status: 404 });
+    }
+
+    /* ---- Monthly order quota enforcement ----
+     * Fail-open: any error degrades to "allow" so a DB hiccup never blocks
+     * a legitimate walk-in order at the counter. */
+    try {
+      const activePlan = await getShopActivePlan(shop.id);
+      const maxOrders = activePlan.max_orders_monthly ?? -1;
+      if (maxOrders !== -1) {
+        const monthStart = new Date();
+        monthStart.setDate(1);
+        monthStart.setHours(0, 0, 0, 0);
+        const { count, error: countErr } = await supabaseAdmin
+          .from('print_jobs')
+          .select('*', { count: 'exact', head: true })
+          .eq('shop_id', shop.id)
+          .gte('created_at', monthStart.toISOString());
+        if (!countErr && count != null && count >= maxOrders) {
+          return NextResponse.json(
+            {
+              success: false,
+              error: 'Monthly order limit reached. Please upgrade your plan.',
+              planLimitReached: true,
+            },
+            { status: 403 }
+          );
+        }
+      }
+    } catch (quotaErr) {
+      console.warn('[manual-entry] quota check error — allowing order:', quotaErr?.message || quotaErr);
     }
 
     /* ---- Upload file if provided ---- */

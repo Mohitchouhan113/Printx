@@ -18,6 +18,7 @@ import {
   Receipt,
   Shield,
   ShieldOff,
+  Lock,
 } from 'lucide-react';
 import PrintXLogo from '../ui/PrintXLogo';
 import BroadcastBanner from '../BroadcastBanner';
@@ -25,6 +26,7 @@ import { ShopProvider, useShop } from '../ShopContext';
 import { AuthProvider, useUserRole, ROLES } from '../../lib/auth';
 import { supabase, isSupabaseConfigured } from '../../lib/supabaseClient';
 import { resolveSubscriptionState } from '../../lib/subscription';
+import { PLANS } from '../../lib/plans';
 
 const DASHBOARD_PATH = '/vendor/dashboard';
 
@@ -43,7 +45,7 @@ function shopInitials(name) {
 export const navItems = [
   { href: DASHBOARD_PATH, icon: LayoutDashboard, label: 'Overview', badge: null, isNew: false, ownerOnly: false },
   { href: `${DASHBOARD_PATH}/orders`, icon: ClipboardList, label: 'Live Print Queue', badge: null, dynamicBadge: true, isNew: false, ownerOnly: false },
-  { href: `${DASHBOARD_PATH}/analytics`, icon: BarChart3, label: 'Shop Analytics', badge: null, isNew: true, ownerOnly: true },
+  { href: `${DASHBOARD_PATH}/analytics`, icon: BarChart3, label: 'Shop Analytics', badge: null, isNew: true, ownerOnly: true, featureFlag: 'has_analytics' },
   { href: `${DASHBOARD_PATH}/billing`, icon: Receipt, label: 'Billing & Subscription', badge: null, isNew: false, ownerOnly: true },
   { href: `${DASHBOARD_PATH}/printers`, icon: Printer, label: 'Printer Fleet', badge: null, isNew: false, ownerOnly: true },
   { href: `${DASHBOARD_PATH}/settings`, icon: Settings, label: 'Settings', badge: null, isNew: false, ownerOnly: true },
@@ -63,7 +65,9 @@ export default function VendorShell({
   basePath = DASHBOARD_PATH,
   shopName = 'PrintX Shop',
   initial = 'PX',
-  shopId = 'demo-shop',
+  // Real shop id when a caller has one; null otherwise. Never 'demo-shop' —
+  // that sentinel used to flow into AuthProvider's shops_members query.
+  shopId = null,
 }) {
   return (
     <ShopProvider>
@@ -90,6 +94,19 @@ function VendorShellInner({ children, basePath, shopName, initial }) {
   const { shop, status: shopStatus, refresh } = useShop();
   const displayName = shop?.name || (shopStatus === 'not-found' ? 'No shop linked' : shopName);
   const displayInitial = shop?.name ? shopInitials(shop.name) : initial;
+
+  /* ---- Plan feature flags from static catalog (sync, no DB round-trip) ----
+   * Used to lock/unlock sidebar nav items. The static PLANS catalog (extended
+   * in lib/plans.js with quota fields) is the source — avoids a DB query on
+   * every navigation render. The analytics page itself does its own dynamic
+   * check; the sidebar just adds a discoverable lock icon. */
+  const activePlanId = shop?.subscription_plan || 'free';
+  const staticPlan = PLANS[activePlanId] || PLANS.free;
+  const planFeatureFlags = {
+    has_analytics: staticPlan.has_analytics ?? true,
+    has_whatsapp_bot: staticPlan.has_whatsapp_bot ?? true,
+    has_custom_poster: staticPlan.has_custom_poster ?? true,
+  };
 
   /* Paper ream stock — numeric-safe (bigint columns can arrive as strings). */
   const stockNum =
@@ -132,6 +149,9 @@ function VendorShellInner({ children, basePath, shopName, initial }) {
       ...item,
       badge: item.dynamicBadge ? queueCount : item.badge,
       href: basePath === DASHBOARD_PATH ? item.href : item.href.replace(DASHBOARD_PATH, basePath),
+      // Lock the item when the active plan doesn't include the feature.
+      // featureFlag absent = no lock. Fail-open: undefined/null flags = unlocked.
+      locked: item.featureFlag ? (planFeatureFlags[item.featureFlag] === false) : false,
     }));
 
   // Exact match for the section root, prefix match for sub-pages.
@@ -184,21 +204,27 @@ function VendorShellInner({ children, basePath, shopName, initial }) {
 
         {/* Nav */}
         <nav className="flex-1 py-4 px-3 space-y-1 overflow-y-auto">
-          {items.map(({ href, icon: Icon, label, badge, isNew }) => {
+          {items.map(({ href, icon: Icon, label, badge, isNew, locked }) => {
             const active = isActive(href);
+            // Locked items redirect to billing with an upgrade query param
+            const navHref = locked
+              ? `${basePath === DASHBOARD_PATH ? DASHBOARD_PATH : basePath}/billing?upgrade=${label.toLowerCase().replace(/\s+/g, '_')}`
+              : href;
             return (
               <Link
                 key={href}
-                href={href}
+                href={navHref}
                 prefetch={true}
                 onClick={() => setMobileOpen(false)}
-                title={collapsed ? label : undefined}
+                title={locked ? `${label} — upgrade your plan to unlock` : (collapsed ? label : undefined)}
                 className={`relative flex items-center gap-3 rounded-xl text-sm font-medium
                   transition-colors duration-200
                   ${collapsed ? 'px-3 py-2.5 justify-center' : 'px-3 py-2.5'}
                   ${active
                     ? 'text-white bg-[#06B6D4]/10 border border-[#06B6D4]/20'
-                    : 'text-[#A0AEC0] hover:bg-[#1E2D4A]/40 hover:text-white border border-transparent'
+                    : locked
+                      ? 'text-slate-600 hover:bg-[#1E2D4A]/30 hover:text-slate-400 border border-transparent'
+                      : 'text-[#A0AEC0] hover:bg-[#1E2D4A]/40 hover:text-white border border-transparent'
                   }`}
               >
                 {/* Active pill */}
@@ -209,27 +235,34 @@ function VendorShellInner({ children, basePath, shopName, initial }) {
                     transition={{ type: 'spring', stiffness: 400, damping: 30 }}
                   />
                 )}
-                <Icon className={`w-5 h-5 flex-shrink-0 ${active ? 'text-[#06B6D4]' : ''}`} />
+                <Icon className={`w-5 h-5 flex-shrink-0 ${active ? 'text-[#06B6D4]' : locked ? 'text-slate-600' : ''}`} />
                 {!collapsed && (
                   <>
                     <span className="flex-1 truncate">{label}</span>
-                    {badge != null && badge > 0 && (
+                    {locked && (
+                      <Lock className="w-3.5 h-3.5 flex-shrink-0 text-slate-600" aria-label="Upgrade required" />
+                    )}
+                    {!locked && badge != null && badge > 0 && (
                       <span className="flex-shrink-0 min-w-[20px] h-5 px-1.5 rounded-full bg-[#06B6D4] text-white text-[11px] font-bold flex items-center justify-center shadow-[0_0_8px_rgba(6,182,212,0.5)]">
                         {badge}
                       </span>
                     )}
-                    {isNew && (
+                    {!locked && isNew && (
                       <span className="flex-shrink-0 text-[10px] font-bold px-1.5 py-0.5 rounded-full bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
                         NEW
                       </span>
                     )}
                   </>
                 )}
-                {/* Collapsed badges — tiny dot */}                    {collapsed && badge != null && badge > 0 && (
+                {/* Collapsed badges — tiny dot */}
+                {collapsed && !locked && badge != null && badge > 0 && (
                   <span className="absolute top-1.5 right-1.5 w-2 h-2 rounded-full bg-[#06B6D4] shadow-[0_0_6px_rgba(6,182,212,0.6)]" />
                 )}
-                {collapsed && isNew && (
+                {collapsed && !locked && isNew && (
                   <span className="absolute top-1.5 right-1.5 w-2 h-2 rounded-full bg-emerald-500 shadow-[0_0_6px_rgba(16,185,129,0.6)]" />
+                )}
+                {collapsed && locked && (
+                  <Lock className="absolute top-1.5 right-1.5 w-2.5 h-2.5 text-slate-600" />
                 )}
               </Link>
             );

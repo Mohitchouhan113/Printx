@@ -3,6 +3,8 @@ import { createClient } from '@supabase/supabase-js';
 import { sendWhatsAppFireAndForget, buildSubmissionMessage, calculatePrice } from '../../../lib/whatsapp';
 import { nextDailyToken } from '../../../lib/dailyToken';
 import { priorityWrite } from '../../../lib/priority';
+import { getShopActivePlan } from '../../../lib/getShopActivePlan';
+import { PLANS } from '../../../lib/plans';
 
 /**
  * POST /api/upload — customer file upload → Supabase Storage + print_jobs row.
@@ -308,6 +310,37 @@ export async function POST(request) {
       );
     }
 
+    /* --------------------- Monthly order quota enforcement --------------------- */
+    // Fail-open: any error in the quota check degrades to "allow" so a DB
+    // hiccup never blocks a real customer order.
+    try {
+      const activePlan = await getShopActivePlan(shop.id);
+      const maxOrders = activePlan.max_orders_monthly ?? -1;
+      if (maxOrders !== -1) {
+        const monthStart = new Date();
+        monthStart.setDate(1);
+        monthStart.setHours(0, 0, 0, 0);
+        const { count, error: countErr } = await supabaseAdmin
+          .from('print_jobs')
+          .select('*', { count: 'exact', head: true })
+          .eq('shop_id', shop.id)
+          .gte('created_at', monthStart.toISOString());
+        if (!countErr && count != null && count >= maxOrders) {
+          return NextResponse.json(
+            {
+              success: false,
+              error: 'Monthly order limit reached for this shop\'s plan. Please contact the shop owner to upgrade.',
+              planLimitReached: true,
+            },
+            { status: 403 }
+          );
+        }
+      }
+    } catch (quotaErr) {
+      // Fail-open: log but never block an order on a quota-check failure
+      console.warn('[upload] quota check error — allowing order:', quotaErr?.message || quotaErr);
+    }
+
     /* --------------------- Upload all files to Storage --------------------- */
     // Targets 'print-files' first (legacy 'print-uploads' as fallback) and
     // self-heals by creating a missing bucket. Storage problems NEVER block
@@ -526,7 +559,15 @@ export async function POST(request) {
       payment_status: paymentStatus,
       payment_mode: paymentMode,
       payment_method: paymentMode === 'WALLET' ? 'wallet' : paymentMode.toLowerCase(),
-      status: 'PENDING',
+      // ⛔ NOT YET IN THE QUEUE. The order starts `unpaid` and is only
+      // promoted to `Queued` by /api/payment/confirm-direct-upi once the
+      // customer's payment has actually come back from the UPI app. This
+      // route deliberately sends NO realtime broadcast to the vendor either
+      // (see the sidecar insert below) — an unpaid draft must never ring the
+      // counter or trigger an auto-print. The vendor's postgres_changes
+      // listener still sees the row, but its status keeps it out of the
+      // announced/active states until payment lands.
+      status: 'unpaid',
     };
 
     // Insert with progressive schema fallback: on schema drift (missing
@@ -605,7 +646,9 @@ export async function POST(request) {
         customer_phone: customerPhone || null,
         file_url: primaryFileUrl,
         file_name: primaryFileName,
-        status: 'PENDING',
+        // Same rule as the full payload: a fallback row is still an UNPAID
+        // draft and must not announce itself to the vendor.
+        status: 'unpaid',
       });
       if (minimal.job) {
         job = minimal.job;
@@ -653,7 +696,10 @@ export async function POST(request) {
       payment_status: paymentStatus,
       // ⚡ Express-rush flag (see lib/priority.js for the dual-write carrier)
       ...priorityWrite(isPriority),
-      status: 'PENDING',
+      // Matches print_jobs above: unpaid until confirm-direct-upi verifies
+      // the payment, then flipped to `Queued` (the two rows share an id, so
+      // the vendor queue only ever sees one of them advance).
+      status: 'unpaid',
       ...(dailyTokenNo != null ? { token_no: dailyTokenNo } : {}),
     };
     // Same adaptive strategy as print_jobs, with its own cache so the orders

@@ -271,13 +271,17 @@ export async function applySubscriptionUpgrade({
  * When `currentExpiryIso` is a genuinely future date (> now), the new expiry
  * is computed from that date so remaining paid days are preserved. Otherwise
  * the calculation falls back to Date.now() (plan expired or first purchase).
+ *
+ * @since 2025-01 — extension-from-current-expiry logic intentional:
+ *   preserves all remaining paid days when the vendor buys/upgrades mid-cycle.
  */
 function computeExpiryFromBase(planId, billingCycle, currentExpiryIso) {
   if (planId === 'lifetime' || billingCycle === 'lifetime') return null;
   const ms = billingCycle === 'yearly' ? YEAR_MS : MONTH_MS;
   const now = Date.now();
   const currentMs = currentExpiryIso ? new Date(currentExpiryIso).getTime() : NaN;
-  // Extend from current expiry only if it is genuinely in the future.
+  // Extends from current expiry only if it is genuinely in the future —
+  // preserves remaining paid days on same-plan renewal and plan upgrades.
   const base = Number.isFinite(currentMs) && currentMs > now ? currentMs : now;
   return new Date(base + ms).toISOString();
 }

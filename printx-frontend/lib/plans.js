@@ -14,6 +14,12 @@ const PLANS = {
     yearly: 0,
     lifetime: null,
     features: ['1 Printer Connection', 'Max 50 Orders/month', 'Manual Token Queue', 'Community Support'],
+    // Quota / feature-gate fields — static fallback when plans table is unavailable
+    max_printers: 1,
+    max_orders_monthly: 50,
+    has_analytics: false,
+    has_whatsapp_bot: false,
+    has_custom_poster: false,
   },
   basic: {
     id: 'basic',
@@ -22,6 +28,11 @@ const PLANS = {
     yearly: 3499,
     lifetime: null,
     features: ['2 Printer Fleet Connections', 'Max 500 Live Orders/month', 'Basic Daily Revenue Analytics', 'Email Support'],
+    max_printers: 2,
+    max_orders_monthly: 500,
+    has_analytics: true,
+    has_whatsapp_bot: false,
+    has_custom_poster: false,
   },
   pro: {
     id: 'pro',
@@ -37,6 +48,11 @@ const PLANS = {
       'Priority WhatsApp Support',
       'Custom Branding on Receipts',
     ],
+    max_printers: 4,
+    max_orders_monthly: -1,
+    has_analytics: true,
+    has_whatsapp_bot: true,
+    has_custom_poster: true,
   },
   advance: {
     id: 'advance',
@@ -51,6 +67,11 @@ const PLANS = {
       'API Access & Custom Billing ERP',
       '24/7 Phone Support',
     ],
+    max_printers: -1,
+    max_orders_monthly: -1,
+    has_analytics: true,
+    has_whatsapp_bot: true,
+    has_custom_poster: true,
   },
   lifetime: {
     id: 'lifetime',
@@ -66,6 +87,11 @@ const PLANS = {
       'All future features included',
       'Zero renewals — ever',
     ],
+    max_printers: -1,
+    max_orders_monthly: -1,
+    has_analytics: true,
+    has_whatsapp_bot: true,
+    has_custom_poster: true,
   },
 };
 
