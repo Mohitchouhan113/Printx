@@ -18,10 +18,19 @@ import { selectStrict } from '../lib/supabaseSelect';
  * survive revalidation.
  */
 
+// Preferred list = columns that exist on the LIVE print_jobs schema (verified
+// against the project's information_schema). Older lists included page_count,
+// paper_size, token_no, is_deleted_from_storage, print_type and auto_printed —
+// none of which exist — so PostgREST answered 400 and selectStrict silently
+// dropped to QUEUE_SAFE_COLS for every poll.
 const QUEUE_PREF_COLS =
-  'id, shop_id, token_number, customer_name, customer_phone, file_name, file_url, pages, page_count, copies, color_option, config, binding_type, binding_cost, paper_size, token_no, is_deleted_from_storage, print_type, files_metadata, auto_printed, status, created_at';
+  'id, shop_id, token_number, customer_name, customer_phone, file_name, file_url, pages, copies, color_option, config, binding_type, binding_cost, files_metadata, status, created_at';
+// SAFE list is the permanent fallback: it must still carry `config` and
+// `files_metadata`, because those are the ONLY places the preview URL lives
+// (print_jobs.file_url is nulled by privacy purges while files_metadata may
+// still hold the tab data the preview modal renders).
 const QUEUE_SAFE_COLS =
-  'id, shop_id, token_number, customer_name, customer_phone, file_name, file_url, pages, copies, color_option, status, created_at';
+  'id, shop_id, token_number, customer_name, customer_phone, file_name, file_url, pages, copies, color_option, config, files_metadata, status, created_at';
 
 async function fetchQueue(shopId) {
   const { data, error } = await selectStrict(

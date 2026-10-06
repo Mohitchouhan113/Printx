@@ -19,7 +19,7 @@ export async function GET() {
 
     const { data: jobs, error: jobsErr } = await supabaseAdmin
       .from('print_jobs')
-      .select('file_url')
+      .select('file_url, files_metadata')
       .not('file_url', 'is', null)
       .limit(5000);
     if (jobsErr) {
@@ -28,7 +28,8 @@ export async function GET() {
 
     const referenced = new Set(
       (jobs || [])
-        .map((j) => parseStoragePath(j.file_url)?.path)
+        .flatMap((j) => [j.file_url, ...(Array.isArray(j.files_metadata) ? j.files_metadata.map((f) => f?.fileUrl) : [])])
+        .map((u) => parseStoragePath(u)?.path)
         .filter(Boolean)
     );
     const orphanCount = files.filter((f) => !referenced.has(f.path)).length;
@@ -52,8 +53,10 @@ export async function GET() {
  * POST /api/storage/admin  { olderThanHours = 24 }
  * "🧹 Purge Completed Order Files (> 24 Hrs)":
  *   1. Find COMPLETED print_jobs older than the cutoff with a live file_url.
- *   2. Remove their PDFs from storage (batched ≤100 per call).
- *   3. NULL file_url + set orders.is_deleted_from_storage = true.
+ *   2. Remove their files from storage (batched ≤100 per call) — including
+ *      every files_metadata[].fileUrl object, not just the legacy file_url.
+ *   3. NULL file_url + scrub files_metadata[].fileUrl, and NULL the sidecar
+ *      file_url + set orders.is_deleted_from_storage = true.
  */
 export async function POST(request) {
   try {
@@ -68,7 +71,7 @@ export async function POST(request) {
 
     const { data: jobs, error: queryErr } = await supabaseAdmin
       .from('print_jobs')
-      .select('id, file_url, file_name')
+      .select('id, file_url, file_name, files_metadata')
       .eq('status', 'COMPLETED')
       .lt('created_at', cutoff)
       .not('file_url', 'is', null)
@@ -82,17 +85,20 @@ export async function POST(request) {
     }
 
     // Remove storage objects (grouped per bucket, batched ≤100).
-    const targets = jobs
-      .map((j) => ({ id: j.id, ...parseStoragePath(j.file_url) }))
-      .filter((t) => t.path);
     const byBucket = new Map();
-    targets.forEach((t) => {
-      if (!byBucket.has(t.bucket)) byBucket.set(t.bucket, []);
-      byBucket.get(t.bucket).push(t.path);
+    jobs.forEach((j) => {
+      const urls = [j.file_url, ...(Array.isArray(j.files_metadata) ? j.files_metadata.map((f) => f?.fileUrl) : [])];
+      urls.filter(Boolean).forEach((u) => {
+        const t = parseStoragePath(u);
+        if (!t) return;
+        if (!byBucket.has(t.bucket)) byBucket.set(t.bucket, new Set());
+        byBucket.get(t.bucket).add(t.path);
+      });
     });
 
     let deletedFiles = 0;
-    for (const [bucket, paths] of byBucket) {
+    for (const [bucket, pathSet] of byBucket) {
+      const paths = [...pathSet];
       for (let i = 0; i < paths.length; i += 100) {
         const batch = paths.slice(i, i + 100);
         const { error: rmErr } = await supabaseAdmin.storage.from(bucket).remove(batch);
@@ -106,18 +112,26 @@ export async function POST(request) {
     }
 
     // Kill the links, keep the analytics rows. (No `updated_at` — missing
-    // columns reject the entire update on drifted schemas.)
+    // columns reject the entire update on drifted schemas.) files_metadata
+    // differs per row, so it's scrubbed one row at a time; scrubbing keeps
+    // pageCount/colorMode and only zeroes fileUrl, so the preview modal can
+    // never render a URL whose object we just deleted.
     const ids = jobs.map((j) => j.id);
-    const { error: nullErr } = await supabaseAdmin
-      .from('print_jobs')
-      .update({ file_url: null })
-      .in('id', ids);
+    let nullErr = null;
+    for (const j of jobs) {
+      const { error: e } = await supabaseAdmin
+        .from('print_jobs')
+        .update({ file_url: null, files_metadata: scrubMetadataUrls(j.files_metadata) })
+        .eq('id', j.id);
+      if (e && !nullErr) nullErr = e;
+    }
     if (nullErr) console.error('[storage/admin] file_url clear failed:', nullErr.message);
 
-    // Flag sidecar rows so vendor UIs show "Purged".
+    // Flag sidecar rows so vendor UIs show "Purged" — and kill their copy of
+    // the URL, which the preview modal falls back to.
     const { error: flagErr } = await supabaseAdmin
       .from('orders')
-      .update({ is_deleted_from_storage: true })
+      .update({ is_deleted_from_storage: true, file_url: null })
       .in('id', ids);
     if (flagErr) console.error('[storage/admin] sidecar flag failed:', flagErr.message);
 
@@ -173,4 +187,13 @@ function parseStoragePath(fileUrl) {
   } catch {
     return null;
   }
+}
+
+/**
+ * Zero out fileUrl on every files_metadata entry while KEEPING the analytics
+ * fields (pageCount, colorMode, sides, copies…).
+ */
+function scrubMetadataUrls(metadata) {
+  if (!Array.isArray(metadata)) return null;
+  return metadata.map((f) => (f && typeof f === 'object' ? { ...f, fileUrl: null } : f));
 }

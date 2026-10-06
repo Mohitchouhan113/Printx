@@ -42,6 +42,9 @@ import { supabase, isSupabaseConfigured } from '../../lib/supabaseClient';
 export default function OrderPreviewModal({ order, onClose, onStatusChange }) {
   const [activeFileIdx, setActiveFileIdx] = useState(0);
   const [zoom, setZoom] = useState(100);
+  // Preflight state for the active file URL: 'checking' | 'ready' | 'missing'.
+  const [previewStatus, setPreviewStatus] = useState('checking');
+  const [previewRetry, setPreviewRetry] = useState(0);
   const [busyAction, setBusyAction] = useState(null);
   const [cancelDialog, setCancelDialog] = useState(false);
   const [cancelReason, setCancelReason] = useState('');
@@ -89,6 +92,38 @@ export default function OrderPreviewModal({ order, onClose, onStatusChange }) {
   }, [order]);
 
   const activeFile = files[activeFileIdx] || files[0];
+
+  /* ---- Preflight the active file URL ----
+   * The modal used to hand the URL straight to a cross-origin <iframe>, whose
+   * load failures never surface to React — a purged object rendered as a
+   * blank frame, and an empty URL fell through to "No file preview
+   * available" with no reason. A HEAD request gives us an honest state:
+   *   2xx        → render the iframe
+   *   404/410    → explicit "file no longer in storage" message
+   *   CORS/network error → render the iframe anyway (never false-negative;
+   *   the browser shows its own error page inside the frame).
+   * The URL itself is a long-lived public URL (or a 7-day signed URL), so
+   * expiry only matters for the life of the object, not the modal session. */
+  useEffect(() => {
+    const url = activeFile?.fileUrl;
+    if (!url) return undefined;
+    let cancelled = false;
+    setPreviewStatus('checking');
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    fetch(url, { method: 'HEAD', cache: 'no-store', signal: controller.signal })
+      .then((res) => {
+        if (!cancelled) setPreviewStatus(res.ok ? 'ready' : 'missing');
+      })
+      .catch(() => {
+        if (!cancelled) setPreviewStatus('ready');
+      })
+      .finally(() => clearTimeout(timer));
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [activeFile?.fileUrl, previewRetry]);
 
   /* ---- Keyboard shortcuts ---- */
   useEffect(() => {
@@ -391,17 +426,46 @@ export default function OrderPreviewModal({ order, onClose, onStatusChange }) {
                       className="w-full"
                     >
                       {activeFile?.fileUrl ? (
-                        <iframe
-                          ref={frameRef}
-                          src={activeFile.fileUrl}
-                          className="w-full border-0 rounded-lg shadow-xl"
-                          style={{ height: `${Math.max(600, zoom * 6)}px` }}
-                          title={`Preview: ${activeFile.fileName}`}
-                        />
+                        previewStatus === 'checking' ? (
+                          <div className="flex flex-col items-center justify-center h-[600px] text-slate-600">
+                            <Loader2 className="w-8 h-8 mb-3 animate-spin text-slate-500" />
+                            <p className="text-xs text-slate-600">Checking file preview…</p>
+                          </div>
+                        ) : previewStatus === 'missing' ? (
+                          <div className="flex flex-col items-center justify-center h-[600px] text-slate-600">
+                            <AlertTriangle className="w-16 h-16 mb-4 text-amber-500/60" />
+                            <p className="text-sm">Preview unavailable — file no longer in storage</p>
+                            <p className="text-xs text-slate-600 mt-2 text-center max-w-[420px]">
+                              The stored object was removed (privacy purge or
+                              24-hour cleanup), so its link is dead even though
+                              the job metadata survives.
+                            </p>
+                            <button
+                              type="button"
+                              onClick={() => setPreviewRetry((n) => n + 1)}
+                              className="mt-4 px-3 py-1.5 text-xs rounded-lg bg-slate-800 border border-slate-700 text-slate-300 hover:text-white transition-colors"
+                            >
+                              Retry preview
+                            </button>
+                          </div>
+                        ) : (
+                          <iframe
+                            ref={frameRef}
+                            src={activeFile.fileUrl}
+                            className="w-full border-0 rounded-lg shadow-xl"
+                            style={{ height: `${Math.max(600, zoom * 6)}px` }}
+                            title={`Preview: ${activeFile.fileName}`}
+                          />
+                        )
                       ) : (
                         <div className="flex flex-col items-center justify-center h-[600px] text-slate-600">
                           <FileText className="w-16 h-16 mb-4" />
                           <p className="text-sm">No file preview available</p>
+                          <p className="text-xs text-slate-600 mt-2 text-center max-w-[420px]">
+                            {order?.is_deleted_from_storage
+                              ? 'This file was purged from storage after the job completed.'
+                              : 'No URL was returned for this job — the link may have been cleared or the upload did not finish.'}
+                          </p>
                         </div>
                       )}
                     </motion.div>
