@@ -331,10 +331,48 @@ export default function BillingContent({ shop = null, shopId = null, shopSlug = 
       </div>
 
       {/* ----------------------- Plan cards ------------------------ */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-5 gap-4">
-        {PLAN_ORDER.map((planId, i) => {
-          const plan = PLANS[planId];
-          const ui = PLAN_UI[planId];
+      {/* When DB plans are loaded use that ordered list so admin-created plans
+          appear automatically. Fall back to the hardcoded PLAN_ORDER constant
+          when the DB hasn't responded yet or the table is missing. */}
+      {(() => {
+        // Build the ordered list of plan IDs to render.
+        // dynamicPlans is the filtered+active array from fetchPlans().
+        const dbPlanIds = dynamicPlans && dynamicPlans.length > 0
+          ? dynamicPlans.map((p) => p.code).filter(Boolean)
+          : null;
+        const renderIds = dbPlanIds || PLAN_ORDER;
+        const colCount = renderIds.length;
+        return (
+          <div className={`grid grid-cols-1 sm:grid-cols-2 gap-4 ${colCount <= 3 ? 'xl:grid-cols-3' : colCount === 4 ? 'xl:grid-cols-4' : 'xl:grid-cols-5'}`}>
+            {renderIds.map((planId, i) => {
+        const plan = PLANS[planId];
+        const ui = PLAN_UI[planId];
+          if (!plan || !ui) {
+            // DB has a plan the static catalog doesn't know — render a generic card
+            const dp = getPlanPrice(planId);
+            return (
+              <motion.div
+                key={planId}
+                initial={{ opacity: 0, y: 14 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ delay: i * 0.06 }}
+                className="relative flex flex-col rounded-2xl p-5 border border-[#1E2D4A] bg-[#1E293B]"
+              >
+                <div className="text-white font-bold text-sm mb-1">{dp.badge || planId}</div>
+                <div className="text-2xl font-black text-white mb-3">₹{(dp.original || 0).toLocaleString('en-IN')}<span className="text-xs text-slate-500 font-normal">/month</span></div>
+                {(dp.dbFeatures || []).map((f, fi) => (
+                  <div key={fi} className="flex items-start gap-2 text-xs text-slate-300 mb-1"><Check className="w-3.5 h-3.5 mt-0.5 text-emerald-400 flex-shrink-0" />{f}</div>
+                ))}
+                <PlanButton
+                  planId={planId} cta={`Upgrade to ${planId}`}
+                  isCurrent={planId === currentPlan} isBusy={busyPlan === planId}
+                  busyStage={phase?.stage} disabled={!!phase}
+                  onPay={() => upgrade(planId)}
+                  hasActivePlan={!!(currentPlan && currentPlan !== 'free' && daysLeft != null && daysLeft > 0)}
+                />
+              </motion.div>
+            );
+          }
           const isCurrent = planId === currentPlan;
           const isBusy = busyPlan === planId;
           const dp = getPlanPrice(planId);
@@ -448,7 +486,9 @@ export default function BillingContent({ shop = null, shopId = null, shopSlug = 
             </motion.div>
           );
         })}
-      </div>
+          </div>
+        );
+      })()}
 
       {/* --------------------- Payment error ----------------------- */}
       <AnimatePresence>

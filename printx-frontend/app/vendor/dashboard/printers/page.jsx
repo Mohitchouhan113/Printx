@@ -245,30 +245,38 @@ export default function PrintersPage() {
 
         showToast('success', 'Printer updated successfully!');
       } else {
-        // --- INSERT new printer ---
+        // --- INSERT new printer via server-side API route (quota-enforced) ---
         const insertPayload = {
-          shop_id: shopId,
+          shopId,
           name: form.name.trim(),
           connection_type: form.connection_type || 'LAN_IP',
           ip_address: form.ip_address.trim() || null,
           is_color: Boolean(form.is_color),
           is_default: Boolean(form.is_default),
-          status: 'online',
         };
         if (form.model.trim()) insertPayload.model = form.model.trim();
 
-        const { error: insertErr } = await supabase
-          .from('printers')
-          .insert([insertPayload])
-          .select();
+        const res = await fetch('/api/printers/add', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(insertPayload),
+        });
+        const json = await res.json().catch(() => ({}));
 
-        if (insertErr) {
-          console.error('[printers] insert error:', insertErr.message, insertErr.code, insertErr.details);
-          showToast('error', insertErr.message || 'Failed to add printer');
+        if (!res.ok) {
+          const msg = json?.error || 'Failed to add printer';
+          if (json?.planLimitReached) {
+            showToast(
+              'error',
+              `${msg} (${json.currentCount ?? printers.length}/${json.maxPrinters} printers used)`
+            );
+          } else {
+            showToast('error', msg);
+          }
           return;
         }
 
-        showToast('success', 'Printer added to database successfully!');
+        showToast('success', 'Printer added successfully!');
       }
 
       // Success: refetch → close modal → reset form
