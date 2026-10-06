@@ -25,6 +25,12 @@ const YEAR_MS = 365 * 24 * 60 * 60 * 1000;
 const LEDGER_MISSING_COLUMNS = new Set();
 
 /**
+ * Columns this deployment's `subscriptions` table turned out not to have.
+ * Same progressive-column-drop pattern as LEDGER_MISSING_COLUMNS.
+ */
+const SUBSCRIPTIONS_MISSING_COLUMNS = new Set();
+
+/**
  * Attribution string for a subscription charge.
  *
  * The live `wallet_transactions` table on this project is only
@@ -63,10 +69,11 @@ export async function applySubscriptionUpgrade({
   orderId,
   invoiceNumber,
 }) {
-  const expiresAt = computeExpiry(planId, billingCycle);
   const label = getPlanLabel(planId, billingCycle);
 
   if (!isSupabaseAdminConfigured || !supabaseAdmin) {
+    // Demo mode: compute without a base (no DB to read from)
+    const expiresAt = computeExpiryFromBase(planId, billingCycle, null);
     console.warn(
       `[subscription] DEMO mode — upgrade not persisted: shop=${shopId} plan=${planId} payment=${paymentId}`
     );
@@ -91,6 +98,8 @@ export async function applySubscriptionUpgrade({
       .limit(1);
     if (!dupErr && applied && applied.length > 0) {
       console.info(`[subscription] payment ${paymentId} already applied — duplicate ignored`);
+      // Re-compute expiry so the caller still gets a valid response
+      const expiresAt = computeExpiryFromBase(planId, billingCycle, null);
       return { ok: true, expiresAt, duplicate: true };
     }
     if (dupErr) {
@@ -104,8 +113,31 @@ export async function applySubscriptionUpgrade({
     .eq('payment_id', paymentId)
     .maybeSingle();
   if (existing) {
+    const expiresAt = computeExpiryFromBase(planId, billingCycle, null);
     return { ok: true, expiresAt, duplicate: true };
   }
+
+  // ---- Fetch current shop subscription state for accurate expiry extension ----
+  // This must happen BEFORE computing the new expiry so remaining paid days
+  // are not lost when a vendor upgrades mid-cycle.
+  const { data: currentShop } = await supabaseAdmin
+    .from('shops')
+    .select('subscription_expires_at, subscription_plan')
+    .eq('id', shopId)
+    .maybeSingle();
+
+  // Compute new expiry — extends from current_expiry if it is still in the future
+  const expiresAt = computeExpiryFromBase(planId, billingCycle, currentShop?.subscription_expires_at);
+
+  // The base date used for the start_date audit field:
+  // same logic as inside computeExpiryFromBase — future expiry or now.
+  const now = Date.now();
+  const currentMs = currentShop?.subscription_expires_at
+    ? new Date(currentShop.subscription_expires_at).getTime()
+    : NaN;
+  const baseDate = Number.isFinite(currentMs) && currentMs > now
+    ? new Date(currentMs).toISOString()
+    : new Date(now).toISOString();
 
   // ---- 1. Update the shop's plan ----
   const { error: shopErr } = await supabaseAdmin
@@ -113,6 +145,7 @@ export async function applySubscriptionUpgrade({
     .update({
       subscription_plan: planId,
       subscription_expires_at: expiresAt,
+      ...(planId === 'lifetime' ? { is_lifetime: true } : {}),
     })
     .eq('id', shopId);
 
@@ -121,8 +154,8 @@ export async function applySubscriptionUpgrade({
     return { ok: false, expiresAt, error: shopErr.message };
   }
 
-  // ---- 2. Invoice/subscription record ----
-  const { error: subErr } = await supabaseAdmin.from('subscriptions').insert({
+  // ---- 2. Invoice/subscription record (with progressive-column-drop for start_date/end_date) ----
+  const subPayload = {
     shop_id: shopId,
     plan_id: planId,
     billing_cycle: planId === 'lifetime' ? 'lifetime' : billingCycle,
@@ -131,7 +164,28 @@ export async function applySubscriptionUpgrade({
     order_id: orderId || null,
     invoice_number: invoiceNumber || `INV-${new Date().getFullYear()}-${paymentId?.slice(-6) || 'NA'}`,
     status: 'paid',
-  });
+    start_date: baseDate,
+    end_date: expiresAt,
+  };
+  let subRow = { ...subPayload };
+  for (const col of SUBSCRIPTIONS_MISSING_COLUMNS) delete subRow[col];
+
+  let subErr = null;
+  for (let i = 0; i < 4; i++) {
+    const { error: err } = await supabaseAdmin.from('subscriptions').insert(subRow);
+    if (!err) { subErr = null; break; }
+    subErr = err;
+    const missing =
+      (err.message || '').match(/'([\w]+)'\s+column|column\s+"(\w+)"/)?.[1] ||
+      (err.message || '').match(/'([\w]+)'\s+column|column\s+"(\w+)"/)?.[2];
+    if ((err.code === 'PGRST204' || err.code === '42703') && missing && missing in subRow) {
+      console.warn(`[subscription] subscriptions missing column "${missing}" — dropping it`);
+      SUBSCRIPTIONS_MISSING_COLUMNS.add(missing);
+      delete subRow[missing];
+      continue;
+    }
+    break;
+  }
 
   if (subErr) {
     // Shop plan already updated; log but don't fail the activation.
@@ -178,10 +232,22 @@ export async function applySubscriptionUpgrade({
   return { ok: true, expiresAt };
 }
 
-/** Expiry timestamp: NULL for lifetime, else NOW + 1 month / 1 year (ISO). */
-function computeExpiry(planId, billingCycle) {
+/** Expiry timestamp: NULL for lifetime, else base + 1 month / 1 year (ISO).
+ *
+ * @param {string} planId          - plan identifier
+ * @param {string} billingCycle    - 'monthly' | 'yearly' | 'lifetime'
+ * @param {string|null} currentExpiryIso - existing subscription_expires_at from DB
+ *
+ * When `currentExpiryIso` is a genuinely future date (> now), the new expiry
+ * is computed from that date so remaining paid days are preserved. Otherwise
+ * the calculation falls back to Date.now() (plan expired or first purchase).
+ */
+function computeExpiryFromBase(planId, billingCycle, currentExpiryIso) {
   if (planId === 'lifetime' || billingCycle === 'lifetime') return null;
-  const base = Date.now();
   const ms = billingCycle === 'yearly' ? YEAR_MS : MONTH_MS;
+  const now = Date.now();
+  const currentMs = currentExpiryIso ? new Date(currentExpiryIso).getTime() : NaN;
+  // Extend from current expiry only if it is genuinely in the future.
+  const base = Number.isFinite(currentMs) && currentMs > now ? currentMs : now;
   return new Date(base + ms).toISOString();
 }

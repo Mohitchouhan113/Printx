@@ -90,7 +90,7 @@ function normalizePlanId(raw) {
   return 'free';
 }
 
-export default function BillingContent({ shop = null, shopId = null, shopSlug = null, shopName = null, shopPhone = null, contextStatus = null, onShopRefresh = () => {} }) {
+export default function BillingContent({ shop = null, shopId = null, shopSlug = null, shopName = null, shopPhone = null, contextStatus = null, onShopRefresh = () => { } }) {
   /* ---- REAL plan state: starts from the shop's actual DB record ---- */
   const [currentPlan, setCurrentPlan] = useState(null); // null = still loading
   const [currentExpiry, setCurrentExpiry] = useState(null);
@@ -302,6 +302,18 @@ export default function BillingContent({ shop = null, shopId = null, shopSlug = 
         daysLeft={daysLeft}
       />
 
+      {/* ---- Active plan extension notice ---- */}
+      {currentPlan !== 'free' && currentPlan !== 'lifetime' && daysLeft != null && daysLeft > 0 && (
+        <div className="flex items-center gap-3 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">
+          <Calendar className="w-4 h-4 flex-shrink-0 text-amber-400" />
+          <span>
+            You have <strong>{daysLeft} day{daysLeft === 1 ? '' : 's'}</strong> remaining on your current plan.
+            Purchasing any plan will extend your subscription from{' '}
+            <strong>{formatDate(currentExpiry)}</strong>.
+          </span>
+        </div>
+      )}
+
       {/* --------------------- Billing cycle ----------------------- */}
       <div className="flex flex-wrap items-center justify-center gap-3 py-2">
         <span className={`text-sm font-semibold transition-colors ${billingCycle === 'monthly' ? 'text-white' : 'text-slate-500'}`}>
@@ -355,15 +367,14 @@ export default function BillingContent({ shop = null, shopId = null, shopSlug = 
               transition={{ delay: i * 0.06 }}
               whileHover={{ scale: 1.015, translateY: -2 }}
               whileTap={{ scale: 0.97 }}
-              className={`relative flex flex-col rounded-2xl p-5 border backdrop-blur-xl transition-colors ${
-                ui.offer
+              className={`relative flex flex-col rounded-2xl p-5 border backdrop-blur-xl transition-colors ${ui.offer
                   ? 'border-amber-400/50 bg-gradient-to-b from-amber-500/10 to-[#1E293B] shadow-[0_0_25px_rgba(245,158,11,0.15)]'
                   : ui.popular
                     ? 'border-cyan-400/60 bg-[#1E293B] shadow-[0_0_25px_rgba(6,182,212,0.18)]'
                     : isCurrent
                       ? 'border-emerald-500/40 bg-[#1E293B] shadow-[0_0_15px_rgba(16,185,129,0.12)]'
                       : 'border-[#1E2D4A] bg-[#1E293B] hover:border-slate-500/60'
-              }`}
+                }`}
             >
               {/* Dynamic Badge from DB */}
               {(() => {
@@ -438,6 +449,7 @@ export default function BillingContent({ shop = null, shopId = null, shopSlug = 
                 busyStage={phase?.stage}
                 disabled={!!phase}
                 onPay={() => upgrade(planId)}
+                hasActivePlan={!!(currentPlan && currentPlan !== 'free' && daysLeft != null && daysLeft > 0)}
               />
             </motion.div>
           );
@@ -507,11 +519,10 @@ function CurrentPlanBanner({ shopName, currentPlan, currentExpiry, planStatusTex
     <motion.div
       initial={{ opacity: 0, y: 10 }}
       animate={{ opacity: 1, y: 0 }}
-      className={`relative overflow-hidden rounded-2xl border p-5 transition-colors ${
-        expired
+      className={`relative overflow-hidden rounded-2xl border p-5 transition-colors ${expired
           ? 'border-red-500/30 bg-gradient-to-r from-[#0B132B] via-[#1E293B] to-[#0B132B]'
           : 'border-cyan-500/25 bg-gradient-to-r from-[#0B132B] via-[#1E293B] to-[#0B132B]'
-      }`}
+        }`}
     >
       <div aria-hidden="true" className="absolute -right-10 -top-10 w-48 h-48 rounded-full bg-cyan-500/10 blur-3xl" />
 
@@ -520,11 +531,10 @@ function CurrentPlanBanner({ shopName, currentPlan, currentExpiry, planStatusTex
           <div className="flex items-center gap-2 mb-1">
             <h2 className="text-white font-bold text-base">{shopName || 'Your Shop'}</h2>
             <span
-              className={`inline-flex items-center gap-1 text-[10px] font-extrabold uppercase px-2 py-0.5 rounded-full border ${
-                expired
+              className={`inline-flex items-center gap-1 text-[10px] font-extrabold uppercase px-2 py-0.5 rounded-full border ${expired
                   ? 'bg-red-500/15 text-red-400 border-red-500/30'
                   : 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30'
-              }`}
+                }`}
             >
               {!expired && (
                 <span className="relative flex h-1.5 w-1.5">
@@ -579,6 +589,18 @@ function CurrentPlanBanner({ shopName, currentPlan, currentExpiry, planStatusTex
           </div>
         </div>
       </div>
+
+      {/* Extension notice — only when vendor has an active paid plan */}
+      {!isFree && !isLifetime && daysLeft != null && daysLeft > 0 && (
+        <div className="mt-4 flex items-start gap-2 rounded-xl border border-amber-500/30 bg-amber-500/8 px-3 py-2.5 text-xs text-amber-300">
+          <Calendar className="w-3.5 h-3.5 mt-0.5 flex-shrink-0 text-amber-400" />
+          <span>
+            You have an active plan. Any new purchase will extend your subscription from{' '}
+            <strong className="text-amber-200">{formatDate(currentExpiry)}</strong>, not
+            today — you won&apos;t lose any remaining {daysLeft} day{daysLeft === 1 ? '' : 's'}.
+          </span>
+        </div>
+      )}
     </motion.div>
   );
 }
@@ -613,7 +635,7 @@ function UsageMeter({ label, display, pct, icon: Icon }) {
 /* ------------------------------------------------------------------ */
 /* CTA button                                                          */
 /* ------------------------------------------------------------------ */
-function PlanButton({ planId, cta, isCurrent, isBusy, busyStage, disabled, onPay }) {
+function PlanButton({ planId, cta, isCurrent, isBusy, busyStage, disabled, onPay, hasActivePlan }) {
   if (isCurrent) {
     return (
       <button
@@ -643,18 +665,17 @@ function PlanButton({ planId, cta, isCurrent, isBusy, busyStage, disabled, onPay
       whileTap={{ scale: disabled ? 1 : 0.96 }}
       onClick={onPay}
       disabled={disabled}
-      className={`w-full flex items-center justify-center gap-1.5 py-2.5 rounded-xl text-xs font-bold transition-colors ${
-        disabled
+      className={`w-full flex items-center justify-center gap-1.5 py-2.5 rounded-xl text-xs font-bold transition-colors ${disabled
           ? 'bg-[#1E2D4A]/50 text-slate-500 border border-slate-600/30 cursor-not-allowed'
           : PLAN_UI[planId].offer
             ? 'bg-gradient-to-r from-cyan-500 to-teal-500 text-white shadow-[0_0_15px_rgba(245,158,11,0.3)]'
             : PLAN_UI[planId].popular
               ? 'bg-gradient-to-r from-cyan-500 to-blue-600 text-white shadow-[0_0_15px_rgba(6,182,212,0.3)]'
               : 'bg-[#1E2D4A] text-slate-200 hover:bg-slate-600/60 border border-slate-600/40'
-      }`}
+        }`}
     >
       <ArrowUpRight className="w-3.5 h-3.5" />
-      {cta}
+      {hasActivePlan ? 'Extend Plan' : cta}
     </motion.button>
   );
 }
@@ -742,11 +763,10 @@ function InvoiceHistory({ invoices, loaded }) {
                   ₹{Number(inv.amount_rupees ?? 0).toLocaleString('en-IN')}
                 </span>
                 <span
-                  className={`inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-full border capitalize ${
-                    String(inv.status) === 'paid'
+                  className={`inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-full border capitalize ${String(inv.status) === 'paid'
                       ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30'
                       : 'bg-amber-500/15 text-amber-400 border-amber-500/30'
-                  }`}
+                    }`}
                 >
                   {String(inv.status) === 'paid' && <Check className="w-3 h-3" />}
                   {String(inv.status || 'pending')}
