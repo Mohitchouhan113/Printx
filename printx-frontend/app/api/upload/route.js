@@ -4,7 +4,10 @@ import { sendWhatsAppFireAndForget, buildSubmissionMessage, calculatePrice } fro
 import { nextDailyToken } from '../../../lib/dailyToken';
 import { priorityWrite } from '../../../lib/priority';
 import { getShopActivePlan } from '../../../lib/getShopActivePlan';
-import { PLANS } from '../../../lib/plans';
+// NOTE: PLANS static catalog is intentionally NOT imported here — quota
+// enforcement goes exclusively through getShopActivePlan (which has its
+// own static fallback internally). Removing this import makes the intent
+// explicit: this route does not use hardcoded plan limits.
 
 /**
  * POST /api/upload — customer file upload → Supabase Storage + print_jobs row.

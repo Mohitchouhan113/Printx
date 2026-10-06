@@ -74,6 +74,15 @@ export default function AnalyticsPage() {
 
   /* ---------- Fetch real print_jobs for THIS shop in the selected range ---------- */
   const fetchJobs = useCallback(async () => {
+    // hasAnalytics starts as true (fail-open) and may flip false after the
+    // plan check resolves. We must not fetch real data for free-plan vendors
+    // — skip until the check has settled (hasAnalytics === false means locked;
+    // true means allowed, whether from DB or the fail-open default).
+    if (hasAnalytics === false) {
+      setJobs([]);
+      setLoading(false);
+      return;
+    }
     if (!isSupabaseConfigured || !supabase || !shop?.id) {
       setJobs([]);
       setLoading(false);
@@ -112,10 +121,12 @@ export default function AnalyticsPage() {
       setJobs(data || []);
     }
     setLoading(false);
-  }, [shop?.id, range]);
+  }, [shop?.id, range, hasAnalytics]);
 
   useEffect(() => {
     if (!authReady) return;
+    // fetchJobs internally checks hasAnalytics — it will short-circuit and
+    // clear jobs when the plan check settles to false.
     fetchJobs();
   }, [authReady, fetchJobs]);
 

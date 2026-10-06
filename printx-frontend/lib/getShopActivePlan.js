@@ -75,8 +75,13 @@ export async function getShopActivePlan(shopId) {
       const isExpired =
         !isLifetime &&
         rawPlan !== 'lifetime' &&
-        expiresAt != null &&
+        expiresAt != null &&  // null-expiry = indefinite access (admin backdoor)
         new Date(expiresAt).getTime() < now;
+      // DELIBERATE: when subscription_expires_at is NULL on a paid plan,
+      // the shop keeps its paid plan indefinitely. This is an admin backdoor:
+      // setting subscription_expires_at = null grants permanent access
+      // (useful for manual grants, beta testers, or resolving billing issues).
+      // Only an explicit past timestamp triggers a downgrade to 'free'.
 
       planId = isExpired ? 'free' : (rawPlan || 'free');
       if (planId === 'lifetime') isLifetime = true;
