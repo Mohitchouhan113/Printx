@@ -302,18 +302,6 @@ export default function BillingContent({ shop = null, shopId = null, shopSlug = 
         daysLeft={daysLeft}
       />
 
-      {/* ---- Active plan extension notice ---- */}
-      {currentPlan !== 'free' && currentPlan !== 'lifetime' && daysLeft != null && daysLeft > 0 && (
-        <div className="flex items-center gap-3 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">
-          <Calendar className="w-4 h-4 flex-shrink-0 text-amber-400" />
-          <span>
-            You have <strong>{daysLeft} day{daysLeft === 1 ? '' : 's'}</strong> remaining on your current plan.
-            Purchasing any plan will extend your subscription from{' '}
-            <strong>{formatDate(currentExpiry)}</strong>.
-          </span>
-        </div>
-      )}
-
       {/* --------------------- Billing cycle ----------------------- */}
       <div className="flex flex-wrap items-center justify-center gap-3 py-2">
         <span className={`text-sm font-semibold transition-colors ${billingCycle === 'monthly' ? 'text-white' : 'text-slate-500'}`}>
@@ -675,7 +663,7 @@ function PlanButton({ planId, cta, isCurrent, isBusy, busyStage, disabled, onPay
         }`}
     >
       <ArrowUpRight className="w-3.5 h-3.5" />
-      {hasActivePlan ? 'Extend Plan' : cta}
+      {hasActivePlan && planId !== 'lifetime' ? 'Extend Plan' : cta}
     </motion.button>
   );
 }

@@ -31,6 +31,13 @@ const LEDGER_MISSING_COLUMNS = new Set();
 const SUBSCRIPTIONS_MISSING_COLUMNS = new Set();
 
 /**
+ * Columns this deployment's `shops` table turned out not to have.
+ * Same progressive-column-drop pattern. Primarily used to handle `is_lifetime`
+ * which may not be present on all deployments.
+ */
+const SHOPS_MISSING_COLUMNS = new Set();
+
+/**
  * Attribution string for a subscription charge.
  *
  * The live `wallet_transactions` table on this project is only
@@ -80,6 +87,16 @@ export async function applySubscriptionUpgrade({
     return { ok: true, demo: true, expiresAt };
   }
 
+  // ---- Fetch current shop subscription state FIRST ----
+  // Must happen before any early-return paths so that even on a duplicate
+  // replay the returned expiresAt reflects the shop's real future expiry,
+  // not now + plan_duration (which would mislead the receipt modal).
+  const { data: currentShop } = await supabaseAdmin
+    .from('shops')
+    .select('subscription_expires_at, subscription_plan')
+    .eq('id', shopId)
+    .maybeSingle();
+
   // ---- Idempotency: skip if this payment was already applied ----
   // Plan intents are stateless (lib/planOrders.js), so nothing server-side
   // marks an intent as "used". A replayed — but genuinely paid — callback
@@ -98,8 +115,8 @@ export async function applySubscriptionUpgrade({
       .limit(1);
     if (!dupErr && applied && applied.length > 0) {
       console.info(`[subscription] payment ${paymentId} already applied — duplicate ignored`);
-      // Re-compute expiry so the caller still gets a valid response
-      const expiresAt = computeExpiryFromBase(planId, billingCycle, null);
+      // Use real shop expiry so the receipt modal shows the correct renewal date.
+      const expiresAt = computeExpiryFromBase(planId, billingCycle, currentShop?.subscription_expires_at);
       return { ok: true, expiresAt, duplicate: true };
     }
     if (dupErr) {
@@ -113,18 +130,10 @@ export async function applySubscriptionUpgrade({
     .eq('payment_id', paymentId)
     .maybeSingle();
   if (existing) {
-    const expiresAt = computeExpiryFromBase(planId, billingCycle, null);
+    // Use real shop expiry so the receipt modal shows the correct renewal date.
+    const expiresAt = computeExpiryFromBase(planId, billingCycle, currentShop?.subscription_expires_at);
     return { ok: true, expiresAt, duplicate: true };
   }
-
-  // ---- Fetch current shop subscription state for accurate expiry extension ----
-  // This must happen BEFORE computing the new expiry so remaining paid days
-  // are not lost when a vendor upgrades mid-cycle.
-  const { data: currentShop } = await supabaseAdmin
-    .from('shops')
-    .select('subscription_expires_at, subscription_plan')
-    .eq('id', shopId)
-    .maybeSingle();
 
   // Compute new expiry — extends from current_expiry if it is still in the future
   const expiresAt = computeExpiryFromBase(planId, billingCycle, currentShop?.subscription_expires_at);
@@ -139,15 +148,36 @@ export async function applySubscriptionUpgrade({
     ? new Date(currentMs).toISOString()
     : new Date(now).toISOString();
 
-  // ---- 1. Update the shop's plan ----
-  const { error: shopErr } = await supabaseAdmin
-    .from('shops')
-    .update({
-      subscription_plan: planId,
-      subscription_expires_at: expiresAt,
-      ...(planId === 'lifetime' ? { is_lifetime: true } : {}),
-    })
-    .eq('id', shopId);
+  // ---- 1. Update the shop's plan (with progressive-drop for is_lifetime) ----
+  // is_lifetime may not exist on all deployments. Use the same progressive-column-drop
+  // pattern so a missing column never blocks a lifetime activation.
+  const shopPayload = {
+    subscription_plan: planId,
+    subscription_expires_at: expiresAt,
+    ...(planId === 'lifetime' ? { is_lifetime: true } : {}),
+  };
+  let shopRow = { ...shopPayload };
+  for (const col of SHOPS_MISSING_COLUMNS) delete shopRow[col];
+
+  let shopErr = null;
+  for (let i = 0; i < 3; i++) {
+    const { error: err } = await supabaseAdmin
+      .from('shops')
+      .update(shopRow)
+      .eq('id', shopId);
+    if (!err) { shopErr = null; break; }
+    shopErr = err;
+    const missing =
+      (err.message || '').match(/'([\w]+)'\s+column|column\s+"(\w+)"/)?.[1] ||
+      (err.message || '').match(/'([\w]+)'\s+column|column\s+"(\w+)"/)?.[2];
+    if ((err.code === 'PGRST204' || err.code === '42703') && missing && missing in shopRow) {
+      console.warn(`[subscription] shops missing column "${missing}" — dropping it`);
+      SHOPS_MISSING_COLUMNS.add(missing);
+      delete shopRow[missing];
+      continue;
+    }
+    break;
+  }
 
   if (shopErr) {
     console.error('[subscription] shops update failed:', shopErr);
