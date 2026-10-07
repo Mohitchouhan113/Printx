@@ -27,6 +27,7 @@ import { PLANS } from '../../lib/plans';
 import { startCheckout } from '../../lib/razorpayCheckout';
 import { supabase, isSupabaseConfigured } from '../../lib/supabaseClient';
 import { fetchPlans, planIsActive } from '../../lib/plansStore';
+import { selectStrict } from '../../lib/supabaseSelect';
 
 /**
  * BillingContent — Billing & Subscription, REAL DATA ONLY.
@@ -38,6 +39,11 @@ import { fetchPlans, planIsActive } from '../../lib/plansStore';
  * - Usage meters computed from the shop's actual print_jobs.
  * - Upgrade buttons run the real Razorpay checkout flow; on success the
  *   context shop is refreshed so every tab reflects the new plan.
+ *
+ * CRASH SAFETY: every read is wrapped and every plan/offer access is guarded
+ * with `?.` + static `PLANS` fallbacks. A missing table, a missing column or
+ * an undefined plan row can never throw a client-side exception — the page
+ * degrades to honest empty/zero states or shows the hardcoded catalog instead.
  */
 
 /* UI presentation metadata keyed by the shared catalog in lib/plans.js */
@@ -90,12 +96,42 @@ function normalizePlanId(raw) {
   return 'free';
 }
 
-export default function BillingContent({ shop = null, shopId = null, shopSlug = null, shopName = null, shopPhone = null, contextStatus = null, onShopRefresh = () => { } }) {
+/**
+ * Fallback presentation for a DB plan the static catalog doesn't know —
+ * generated instead of looked up, so an admin-created plan code can't
+ * produce `undefined` that later blows up on `.offer` / `.popular`.
+ */
+function planUiFor(planId) {
+  if (PLAN_UI[planId]) return PLAN_UI[planId];
+  return {
+    icon: Sparkles,
+    tagline: 'Custom plan from the catalog',
+    accent: 'text-slate-400',
+    iconWrap: 'bg-slate-500/10 border border-slate-500/30',
+    cta: `Upgrade to ${capitalize(planId)}`,
+  };
+}
+
+/** The shop is a demo/parked row whose plan must not trigger "Extend Plan". */
+function isDemoPlanId(raw) {
+  const v = String(raw || '').toLowerCase();
+  return v.includes('demo') || v.includes('sharma');
+}
+
+export default function BillingContent({
+  shop = null,
+  shopId = null,
+  shopSlug = null,
+  shopName = null,
+  shopPhone = null,
+  contextStatus = null,
+  onShopRefresh = () => { },
+}) {
   /* ---- REAL plan state: starts from the shop's actual DB record ---- */
   const [currentPlan, setCurrentPlan] = useState(null); // null = still loading
   const [currentExpiry, setCurrentExpiry] = useState(null);
   const [planStatus, setPlanStatus] = useState(null); // shops.status — 'active' | 'suspended' | ...
-  const [invoices, setInvoices] = useState([]); // REAL rows from `subscriptions`
+  const [invoices, setInvoices] = useState([]); // REAL rows from `subscriptions`/ledger
   const [invoicesLoaded, setInvoicesLoaded] = useState(false);
   const [usage, setUsage] = useState({ ordersThisMonth: 0, pagesThisMonth: 0 });
   const [billingCycle, setBillingCycle] = useState('monthly'); // monthly | yearly
@@ -107,11 +143,17 @@ export default function BillingContent({ shop = null, shopId = null, shopSlug = 
   const isYearly = billingCycle === 'yearly';
   const busyPlan = phase?.planId || null;
 
+  /* ---- Loading skeleton while the context shop / plan is still resolving ----
+   * `shop` is null on /shop/[slug]/billing (no ShopContext there) and while
+   * ShopContext is still resolving owner→shop; gate on shopId so those pages
+   * render instead of waiting on a prop that never arrives. */
+  const planResolved = currentPlan != null || shopId != null;
+
   const hydrateFromShop = useCallback((row) => {
     if (!row) return;
-    setCurrentPlan(normalizePlanId(row.subscription_plan));
-    setCurrentExpiry(row.subscription_expires_at || null);
-    setPlanStatus(row.status || null);
+    setCurrentPlan(normalizePlanId(row?.subscription_plan));
+    setCurrentExpiry(row?.subscription_expires_at || null);
+    setPlanStatus(row?.status || null);
   }, []);
 
   /* Hydrate the REAL plan/expiry/status whenever the context shop lands or refreshes */
@@ -127,92 +169,148 @@ export default function BillingContent({ shop = null, shopId = null, shopSlug = 
       return;
     }
 
-    /* Invoices — real subscription payments, newest first */
-    const { data: invData, error: invErr } = await supabase
-      .from('subscriptions')
-      .select('*')
-      .eq('shop_id', shopId)
-      .order('created_at', { ascending: false })
-      .limit(50);
-    if (invErr) {
-      console.error('Supabase Error:', invErr);
+    /* Invoices — real subscription payments, newest first.
+     * `subscriptions` may not exist on every deployment (PostgREST 404s it);
+     * on this project the actual applied-payment ledger is `wallet_transactions`
+     * whose description carries "… subscription · shop <id> · payment <pid>".
+     * Try the rich table first, then the always-present ledger. Both wrapped in
+     * try/catch: an infrastructure error is logged, never thrown. */
+    try {
+      const { data: invData, error: invErr } = await selectStrict(
+        (cols) =>
+          supabase
+            .from('subscriptions')
+            .select(cols)
+            .eq('shop_id', shopId)
+            .order('created_at', { ascending: false })
+            .limit(50),
+        'id, shop_id, plan_id, billing_cycle, amount_rupees, invoice_number, payment_id, status, start_date, end_date, created_at',
+        'id, plan_id, billing_cycle, amount_rupees, invoice_number, status, created_at',
+        'billing:invoices'
+      );
+      if (invErr) {
+        console.warn('[billing] invoices query failed — falling back to ledger:', invErr?.message || invErr);
+        setInvoices(await fetchLedgerInvoices(shopId));
+      } else if (!invData || invData.length === 0) {
+        setInvoices(await fetchLedgerInvoices(shopId));
+      } else {
+        setInvoices(invData.map(toInvoice));
+      }
+    } catch (invErr) {
+      console.warn('[billing] invoices query threw — treating as empty:', invErr?.message || invErr);
       setInvoices([]);
-    } else {
-      setInvoices(invData || []);
     }
     setInvoicesLoaded(true);
 
-    /* Usage — this month's real print_jobs */
-    const since = new Date();
-    since.setDate(1);
-    since.setHours(0, 0, 0, 0);
-    const { data: jobsData, error: jobsErr } = await supabase
-      .from('print_jobs')
-      .select('status, page_count, created_at')
-      .eq('shop_id', shopId)
-      .gte('created_at', since.toISOString())
-      .limit(1000);
-    if (jobsErr) {
-      console.error('Supabase Error:', jobsErr);
+    /* Usage — this month's real print_jobs.
+     * page_count is NOT on the live schema (orders carry `pages` = total
+     * sheets); requesting it on a raw select 400s the whole query. selectStrict
+     * probes the extended list and drops to the verified one automatically. */
+    try {
+      const since = new Date();
+      since.setDate(1);
+      since.setHours(0, 0, 0, 0);
+      const { data: jobsData, error: jobsErr } = await selectStrict(
+        (cols) =>
+          supabase
+            .from('print_jobs')
+            .select(cols)
+            .eq('shop_id', shopId)
+            .gte('created_at', since.toISOString())
+            .limit(1000),
+        'id, status, pages, copies, color_option, config, created_at',
+        'id, status, pages, copies, color_option, config, created_at',
+        'billing:usage'
+      );
+      if (jobsErr) {
+        console.warn('[billing] print_jobs usage query failed — usage shown as zero:', jobsErr?.message || jobsErr);
+        setUsage({ ordersThisMonth: 0, pagesThisMonth: 0 });
+        return;
+      }
+      const jobs = jobsData || [];
+      const completed = jobs.filter((j) => String(j?.status || '').toUpperCase() === 'COMPLETED');
+      setUsage({
+        ordersThisMonth: completed.length,
+        pagesThisMonth: completed.reduce((sum, j) => sum + (Number(j?.page_count ?? j?.pages ?? 0) || 0), 0),
+      });
+    } catch (jobsErr) {
+      console.warn('[billing] print_jobs usage query threw — treating as zero:', jobsErr?.message || jobsErr);
       setUsage({ ordersThisMonth: 0, pagesThisMonth: 0 });
-      return;
     }
-    const jobs = jobsData || [];
-    const completed = jobs.filter((j) => String(j.status || '').toUpperCase() === 'COMPLETED');
-    setUsage({
-      ordersThisMonth: completed.length,
-      pagesThisMonth: completed.reduce((sum, j) => sum + (Number(j.page_count) || 0), 0),
-    });
   }, [shopId]);
 
   useEffect(() => {
-    loadBillingData();
+    let cancelled = false; // avoid setState-after-unmount warnings
+    (async () => {
+      await loadBillingData();
+      if (cancelled) return;
+    })();
+    return () => { cancelled = true; };
   }, [loadBillingData]);
 
   /* ---- Fetch dynamic plans from Supabase `plans` table ----
-   * The table stores `is_active` (there is no `active` column), so the old
-   * `.eq('active', true)` filter always came back PGRST204 and this block
-   * silently kept the hardcoded prices — live offer prices and badges never
-   * reached the customer. Read every row and filter the flag in JS. */
+   * fetchPlans() itself is column-tolerant (lib/plansStore) and never throws;
+   * this block additionally try/catches so an unexpected reject (offline,
+   * network race) leaves the static catalog in place instead of crashing. */
   useEffect(() => {
     if (!isSupabaseConfigured || !supabase) return;
+    let cancelled = false;
     (async () => {
       try {
         const { data, error } = await fetchPlans();
+        if (cancelled) return;
         if (error || !data || data.length === 0) return; // table may not exist yet
         const active = data.filter((p) => planIsActive(p));
         if (active.length > 0) {
           console.log('Dynamic plans loaded:', active.length);
           setDynamicPlans(active);
         }
-      } catch { /* table may not exist yet */ }
+      } catch (plansErr) {
+        console.warn('[billing] dynamic plans fetch failed — using static catalog:', plansErr?.message || plansErr);
+      }
     })();
+    return () => { cancelled = true; };
   }, []);
 
   /* Merge dynamic plans with hardcoded fallbacks */
   const resolvedPlans = useMemo(() => {
     if (!dynamicPlans || dynamicPlans.length === 0) return null;
     const map = {};
-    dynamicPlans.forEach((dp) => { map[dp.code] = dp; });
+    dynamicPlans.forEach((dp) => { if (dp?.code) map[dp.code] = dp; });
     return map;
   }, [dynamicPlans]);
 
-  const getPlanPrice = (planId) => {
+  const getPlanPrice = useCallback((planId) => {
     const dp = resolvedPlans?.[planId];
+    const staticPlan = PLANS[planId] || null;
+    /* Number(null) === 0 — a NULL offer_price must NOT become a ₹0 flash
+     * sale, and a NULL original_price must fall back to the static catalog.
+     * Convert only genuine numeric values; treat null/'' as "not a price". */
+    const toPrice = (v) => (v == null || v === '' ? NaN : Number(v));
     if (dp) {
-      const hasOffer = dp.offer_price != null && Number(dp.offer_price) < Number(dp.original_price);
+      const dbOriginal = toPrice(dp.original_price);
+      const dbOffer = toPrice(dp.offer_price);
+      const hasOffer = Number.isFinite(dbOffer) && Number.isFinite(dbOriginal) && dbOffer < dbOriginal;
+      // Prefer the verified static price when the DB row is garbage (null /
+      // NaN / negative), so a corrupt row can never render "₹NaN" or "₹0".
+      const fallbackMonthly = Number(staticPlan?.monthly ?? 0);
+      const original = Number.isFinite(dbOriginal) && dbOriginal >= 0 ? dbOriginal : fallbackMonthly;
       return {
-        monthly: hasOffer ? Number(dp.offer_price) : Number(dp.original_price),
-        original: Number(dp.original_price),
-        offer: hasOffer ? Number(dp.offer_price) : null,
+        monthly: Number.isFinite(dbOffer) ? dbOffer : original,
+        original,
+        offer: hasOffer ? dbOffer : null,
         badge: dp.badge_tag || null,
-        dbFeatures: Array.isArray(dp.features) ? dp.features : null,
+        dbFeatures: Array.isArray(dp.features) && dp.features.every((f) => typeof f === 'string') ? dp.features : null,
       };
     }
-    const plan = PLANS[planId];
-    if (!plan) return { monthly: 0, original: 0, offer: null, badge: null, dbFeatures: null };
-    return { monthly: plan.monthly, original: plan.monthly, offer: null, badge: null, dbFeatures: null };
-  };
+    return {
+      monthly: Number(staticPlan?.monthly ?? 0),
+      original: Number(staticPlan?.monthly ?? 0),
+      offer: null,
+      badge: null,
+      dbFeatures: null,
+    };
+  }, [resolvedPlans]);;
 
   /* ------------------------- Checkout flow ------------------------- */
   const upgrade = async (planId) => {
@@ -222,15 +320,22 @@ export default function BillingContent({ shop = null, shopId = null, shopSlug = 
     const cycle = planId === 'lifetime' ? 'lifetime' : billingCycle;
     setPhase({ planId, stage: 'creating' });
 
-    const result = await startCheckout({
-      planId,
-      billingCycle: cycle,
-      shopId,
-      shopSlug: shopSlug || shop?.slug || null,
-      shopName: shopName || shop?.name || 'PrintX Shop',
-      shopPhone,
-      onPhase: (stage) => setPhase({ planId, stage }),
-    });
+    let result;
+    try {
+      result = await startCheckout({
+        planId,
+        billingCycle: cycle,
+        shopId,
+        shopSlug: shopSlug || shop?.slug || null,
+        shopName: shopName || shop?.name || 'PrintX Shop',
+        shopPhone,
+        onPhase: (stage) => setPhase({ planId, stage }),
+      });
+    } catch (checkoutErr) {
+      // startCheckout is defensive, but an unexpected reject must not leave
+      // the card stuck in "Creating order…" forever.
+      result = { ok: false, error: checkoutErr?.message || 'Payment could not be started.' };
+    }
 
     setPhase(null);
 
@@ -242,15 +347,20 @@ export default function BillingContent({ shop = null, shopId = null, shopSlug = 
     // ---- Success ----
     // The plan shown here is the one the SERVER activated (result.planId),
     // not the one that was clicked — the server decides what was paid for.
-    const activatedPlanId = result.planId || planId;
-    const plan = PLANS[activatedPlanId] || PLANS[planId];
-    const amount = planId === 'lifetime' ? plan.lifetime : cycle === 'yearly' ? plan.yearly : plan.monthly;
+    const activatedPlanId = normalizePlanId(result.planId || planId);
+    const plan = PLANS[activatedPlanId] || PLANS[planId] || { monthly: 0, yearly: 0, lifetime: 0 };
+    const amount =
+      planId === 'lifetime'
+        ? Number(plan.lifetime ?? 0)
+        : cycle === 'yearly'
+          ? Number(plan.yearly ?? 0)
+          : Number(plan.monthly ?? 0);
 
-    setCurrentPlan(normalizePlanId(activatedPlanId));
+    setCurrentPlan(activatedPlanId);
     setCurrentExpiry(result.expiresAt || null);
 
     // Invoices are REAL database rows — never synthesise one here. Reload
-    // from `subscriptions` so the list only ever shows persisted payments.
+    // from the ledger so the list only ever shows persisted payments.
     await loadBillingData();
 
     setSuccessTx({
@@ -273,7 +383,22 @@ export default function BillingContent({ shop = null, shopId = null, shopSlug = 
     return Number.isFinite(ms) ? Math.max(0, Math.ceil(ms / 86400000)) : null;
   }, [currentExpiry]);
 
-  const planStatusText = planStatus === 'suspended' ? 'Suspended' : currentPlan === 'free' ? 'Active' : 'Active';
+  const planStatusText = planStatus === 'suspended' ? 'Suspended' : 'Active';
+
+  /* Ordered plan list: DB rows first, static catalog as fallback structure */
+  const renderPlanIds = useMemo(() => {
+    const dbPlanIds = dynamicPlans && dynamicPlans.length > 0
+      ? dynamicPlans.map((p) => p.code).filter(Boolean)
+      : null;
+    if (!dbPlanIds) return PLAN_ORDER;
+    // Union keeps catalog order for known ids and appends admin-created ones.
+    const set = new Set(dbPlanIds.concat(PLAN_ORDER.filter((id) => !dbPlanIds.includes(id))));
+    return Array.from(set);
+  }, [dynamicPlans]);
+
+  if (!planResolved) {
+    return <BillingSkeleton />;
+  }
 
   return (
     <div className="max-w-6xl mx-auto space-y-6">
@@ -334,161 +459,20 @@ export default function BillingContent({ shop = null, shopId = null, shopSlug = 
       {/* When DB plans are loaded use that ordered list so admin-created plans
           appear automatically. Fall back to the hardcoded PLAN_ORDER constant
           when the DB hasn't responded yet or the table is missing. */}
-      {(() => {
-        // Build the ordered list of plan IDs to render.
-        // dynamicPlans is the filtered+active array from fetchPlans().
-        const dbPlanIds = dynamicPlans && dynamicPlans.length > 0
-          ? dynamicPlans.map((p) => p.code).filter(Boolean)
-          : null;
-        const renderIds = dbPlanIds || PLAN_ORDER;
-        const colCount = renderIds.length;
-        return (
-          <div className={`grid grid-cols-1 sm:grid-cols-2 gap-4 ${colCount <= 3 ? 'xl:grid-cols-3' : colCount === 4 ? 'xl:grid-cols-4' : 'xl:grid-cols-5'}`}>
-            {renderIds.map((planId, i) => {
-        const plan = PLANS[planId];
-        const ui = PLAN_UI[planId];
-          if (!plan || !ui) {
-            // DB has a plan the static catalog doesn't know — render a generic card
-            const dp = getPlanPrice(planId);
-            return (
-              <motion.div
-                key={planId}
-                initial={{ opacity: 0, y: 14 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ delay: i * 0.06 }}
-                className="relative flex flex-col rounded-2xl p-5 border border-[#1E2D4A] bg-[#1E293B]"
-              >
-                <div className="text-white font-bold text-sm mb-1">{dp.badge || planId}</div>
-                <div className="text-2xl font-black text-white mb-3">₹{(dp.original || 0).toLocaleString('en-IN')}<span className="text-xs text-slate-500 font-normal">/month</span></div>
-                {(dp.dbFeatures || []).map((f, fi) => (
-                  <div key={fi} className="flex items-start gap-2 text-xs text-slate-300 mb-1"><Check className="w-3.5 h-3.5 mt-0.5 text-emerald-400 flex-shrink-0" />{f}</div>
-                ))}
-                <PlanButton
-                  planId={planId} cta={`Upgrade to ${planId}`}
-                  isCurrent={planId === currentPlan} isBusy={busyPlan === planId}
-                  busyStage={phase?.stage} disabled={!!phase}
-                  onPay={() => upgrade(planId)}
-                  hasActivePlan={!!(currentPlan && currentPlan !== 'free' && daysLeft != null && daysLeft > 0)}
-                />
-              </motion.div>
-            );
-          }
-          const isCurrent = planId === currentPlan;
-          const isBusy = busyPlan === planId;
-          const dp = getPlanPrice(planId);
-          const hasOffer = dp.offer != null && dp.offer < dp.original;
-          // Dynamic monthly rate: use DB offer price when available
-          const rate = planId === 'lifetime'
-            ? (dp.original || plan.lifetime)
-            : isYearly
-              ? Math.round((dp.original || plan.yearly) / 12)
-              : (hasOffer ? dp.offer : (dp.monthly || plan.monthly));
-          // Dynamic yearly billed string: use DB original_price when available
-          const yearlyTotal = dp.original || plan.yearly;
-          const billed =
-            planId === 'lifetime'
-              ? 'One-time · never expires'
-              : rate === 0
-                ? 'Free forever'
-                : isYearly
-                  ? `Billed ₹${yearlyTotal.toLocaleString('en-IN')}/year`
-                  : 'Billed monthly';
-
-          return (
-            <motion.div
-              key={planId}
-              initial={{ opacity: 0, y: 14 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ delay: i * 0.06 }}
-              whileHover={{ scale: 1.015, translateY: -2 }}
-              whileTap={{ scale: 0.97 }}
-              className={`relative flex flex-col rounded-2xl p-5 border backdrop-blur-xl transition-colors ${ui.offer
-                  ? 'border-amber-400/50 bg-gradient-to-b from-amber-500/10 to-[#1E293B] shadow-[0_0_25px_rgba(245,158,11,0.15)]'
-                  : ui.popular
-                    ? 'border-cyan-400/60 bg-[#1E293B] shadow-[0_0_25px_rgba(6,182,212,0.18)]'
-                    : isCurrent
-                      ? 'border-emerald-500/40 bg-[#1E293B] shadow-[0_0_15px_rgba(16,185,129,0.12)]'
-                      : 'border-[#1E2D4A] bg-[#1E293B] hover:border-slate-500/60'
-                }`}
-            >
-              {/* Dynamic Badge from DB */}
-              {(() => {
-                return dp.badge ? (
-                  <div className="absolute -top-3 left-1/2 -translate-x-1/2 flex items-center gap-1 px-3 py-1 rounded-full bg-gradient-to-r from-amber-500 to-orange-500 text-white text-[10px] font-extrabold uppercase tracking-wider shadow-[0_0_15px_rgba(245,158,11,0.5)]">
-                    <Gift className="w-3 h-3" />
-                    {dp.badge}
-                  </div>
-                ) : ui.popular ? (
-                  <div className="absolute -top-3 left-1/2 -translate-x-1/2 flex items-center gap-1 px-3 py-1 rounded-full bg-gradient-to-r from-cyan-500 to-blue-600 text-white text-[10px] font-extrabold uppercase tracking-wider shadow-[0_0_15px_rgba(6,182,212,0.5)]">
-                    <Crown className="w-3 h-3" />
-                    Popular
-                  </div>
-                ) : null;
-              })()}
-
-              {/* Plan head */}
-              <div className="flex items-center gap-2.5 mb-3">
-                <div className={`w-9 h-9 rounded-xl flex items-center justify-center ${ui.iconWrap}`}>
-                  <ui.icon className={`w-5 h-5 ${ui.accent}`} />
-                </div>
-                <div>
-                  <div className="text-white font-bold text-sm">{plan.name}</div>
-                  <div className="text-slate-500 text-[11px]">{ui.tagline}</div>
-                </div>
-              </div>
-
-              {/* Price — dynamic offer price from DB with strikethrough */}
-              {(() => {
-                const hasOfferLocal = dp.offer != null && dp.offer < dp.original;
-                const displayRate = planId === 'lifetime' ? (dp.original || plan.lifetime) : (hasOfferLocal ? dp.offer : rate);
-                return (
-                  <div>
-                    <div className="flex items-baseline gap-2">
-                      <span className={`text-2xl font-black tracking-tight ${hasOfferLocal ? 'text-emerald-400' : 'text-white'}`}>
-                        ₹{displayRate.toLocaleString('en-IN')}
-                      </span>
-                      {hasOfferLocal && (
-                        <span className="text-sm text-slate-500 line-through">₹{dp.original.toLocaleString('en-IN')}</span>
-                      )}
-                      <span className="text-xs text-slate-500">
-                        {planId === 'lifetime' ? 'once' : '/month'}
-                      </span>
-                    </div>
-                    <div className="text-[11px] text-slate-500 mt-1 mb-3 h-4">{billed}</div>
-                  </div>
-                );
-              })()}
-
-              {/* Features — use DB features if available, else hardcoded */}
-              <ul className="space-y-2.5 flex-1 mb-5">
-                {(() => {
-                  const features = dp.dbFeatures || plan.features;
-                  return features.map((f, fi) => (
-                    <li key={fi} className="flex items-start gap-2 text-xs text-slate-300">
-                      <Check className="w-3.5 h-3.5 mt-0.5 text-emerald-400 flex-shrink-0" />
-                      <span>{f}</span>
-                    </li>
-                  ));
-                })()}
-              </ul>
-
-              {/* CTA */}
-              <PlanButton
-                planId={planId}
-                cta={ui.cta}
-                isCurrent={isCurrent}
-                isBusy={isBusy}
-                busyStage={phase?.stage}
-                disabled={!!phase}
-                onPay={() => upgrade(planId)}
-                hasActivePlan={!!(currentPlan && currentPlan !== 'free' && daysLeft != null && daysLeft > 0)}
-              />
-            </motion.div>
-          );
-        })}
-          </div>
-        );
-      })()}
+      {renderPlanIds.map((planId, i) => (
+        <PlanCard
+          key={planId}
+          planId={planId}
+          index={i}
+          currentPlan={currentPlan}
+          isYearly={isYearly}
+          busyPlan={busyPlan}
+          phase={phase}
+          shopStatus={planStatus}
+          onPay={() => upgrade(planId)}
+          getPlanPrice={getPlanPrice}
+        />
+      ))}
 
       {/* --------------------- Payment error ----------------------- */}
       <AnimatePresence>
@@ -530,12 +514,176 @@ export default function BillingContent({ shop = null, shopId = null, shopSlug = 
 }
 
 /* ------------------------------------------------------------------ */
+/* Loading skeleton — renders while ShopContext resolves the shop /    */
+/* plan row; guards the fix for the original undefined-offer crash.    */
+/* ------------------------------------------------------------------ */
+function BillingSkeleton() {
+  return (
+    <div className="max-w-6xl mx-auto space-y-6" aria-busy="true" aria-live="polite">
+      <div className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3">
+        <div>
+          <h1 className="text-3xl font-black text-white tracking-tight">Billing &amp; Subscription</h1>
+          <p className="text-slate-400 text-sm mt-1.5">Loading your plan…</p>
+        </div>
+        <div className="flex items-center gap-2 text-xs text-slate-400 bg-[#1E293B] border border-[#1E2D4A] rounded-xl px-3 py-2 w-fit">
+          <Loader2 className="w-3.5 h-3.5 animate-spin text-emerald-400" />
+          <span className="animate-pulse">Loading…</span>
+        </div>
+      </div>
+
+      <div className="rounded-2xl border border-[#1E2D4A] bg-[#1E293B] p-5">
+        <div className="animate-pulse space-y-3">
+          <div className="h-5 w-44 rounded bg-slate-700/50" />
+          <div className="h-3 w-32 rounded bg-slate-700/30" />
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 pt-2">
+            <div className="h-16 rounded-xl bg-slate-700/25" />
+            <div className="h-16 rounded-xl bg-slate-700/25" />
+            <div className="h-16 rounded-xl bg-slate-700/25" />
+          </div>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-5 gap-4">
+        {PLAN_ORDER.map((id) => (
+          <div key={id} className="rounded-2xl border border-[#1E2D4A] bg-[#1E293B] p-5 animate-pulse">
+            <div className="h-9 w-9 rounded-xl bg-slate-700/40 mb-3" />
+            <div className="h-4 w-20 rounded bg-slate-700/40 mb-2" />
+            <div className="h-7 w-16 rounded bg-slate-700/40 mb-4" />
+            <div className="space-y-2 mb-5">
+              <div className="h-3 w-full rounded bg-slate-700/25" />
+              <div className="h-3 w-5/6 rounded bg-slate-700/25" />
+              <div className="h-3 w-2/3 rounded bg-slate-700/25" />
+            </div>
+            <div className="h-9 w-full rounded-xl bg-slate-700/40" />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* PlanCard — one pricing card. Pure presentation over getPlanPrice.   */
+/* ------------------------------------------------------------------ */
+function PlanCard({ planId, index, currentPlan, isYearly, busyPlan, phase, shopStatus, onPay, getPlanPrice }) {
+  const plan = PLANS[planId] || null;
+  const ui = planUiFor(planId);
+  const dp = (getPlanPrice || (() => ({ monthly: 0, original: 0, offer: null, badge: null, dbFeatures: null })))(planId);
+  const isCurrent = planId === currentPlan;
+  const isBusy = busyPlan === planId;
+  const hasOffer = dp.offer != null && dp.offer < dp.original;
+  const hasActivePlan =
+    !!(currentPlan && currentPlan !== 'free' && !isDemoPlanId(currentPlan) && dp.original > 0);
+
+  // Dynamic monthly rate: use DB offer price when available
+  const rate = Number(planId === 'lifetime'
+    ? (dp.original || plan?.lifetime || 0)
+    : isYearly
+      ? Math.round((dp.original || plan?.yearly || 0) / 12)
+      : (hasOffer ? dp.offer : (dp.monthly || plan?.monthly || 0)));
+  const yearlyTotal = Number(dp.original || plan?.yearly || 0) || 0;
+  const billed =
+    planId === 'lifetime'
+      ? 'One-time · never expires'
+      : rate === 0
+        ? 'Free forever'
+        : isYearly
+          ? `Billed ₹${yearlyTotal.toLocaleString('en-IN')}/year`
+          : 'Billed monthly';
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 14 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ delay: index * 0.06 }}
+      whileHover={{ scale: 1.015, translateY: -2 }}
+      whileTap={{ scale: 0.97 }}        className={`relative flex flex-col rounded-2xl p-5 border backdrop-blur-xl transition-colors ${ui?.offer
+          ? 'relative border-amber-400/50 bg-gradient-to-b from-amber-500/10 to-[#1E293B] shadow-[0_0_25px_rgba(245,158,11,0.15)]'
+        : ui?.popular
+          ? 'border-cyan-400/60 bg-[#1E293B] shadow-[0_0_25px_rgba(6,182,212,0.18)]'
+          : isCurrent
+            ? 'border-emerald-500/40 bg-[#1E293B] shadow-[0_0_15px_rgba(16,185,129,0.12)]'
+            : 'border-[#1E2D4A] bg-[#1E293B] hover:border-slate-500/60'
+        }`}
+    >
+      {/* Dynamic Badge from DB */}
+      {dp.badge ? (
+        <div className="absolute -top-3 left-1/2 -translate-x-1/2 z-10 flex items-center gap-1 px-3 py-1 rounded-full bg-gradient-to-r from-amber-500 to-orange-500 text-white text-[10px] font-extrabold uppercase tracking-wider shadow-[0_0_15px_rgba(245,158,11,0.5)]">
+          <Gift className="w-3 h-3" />
+          {dp.badge}
+        </div>
+      ) : ui?.popular ? (
+        <div className="absolute -top-3 left-1/2 -translate-x-1/2 z-10 flex items-center gap-1 px-3 py-1 rounded-full bg-gradient-to-r from-cyan-500 to-blue-600 text-white text-[10px] font-extrabold uppercase tracking-wider shadow-[0_0_15px_rgba(6,182,212,0.5)]">
+          <Crown className="w-3 h-3" />
+          Popular
+        </div>
+      ) : null}
+
+      {/* Plan head */}
+      <div className="flex items-center gap-2.5 mb-3">
+        <div className={`w-9 h-9 rounded-xl flex items-center justify-center ${ui?.iconWrap || 'bg-slate-500/10 border border-slate-500/30'}`}>
+          {ui?.icon
+            ? (React.createElement(ui.icon, { className: `w-5 h-5 ${ui?.accent || 'text-slate-400'}` }))
+            : <Sparkles className="w-5 h-5 text-slate-400" />}
+        </div>
+        <div>
+          <div className="text-white font-bold text-sm">{plan?.name || capitalize(planId)}</div>
+          <div className="text-slate-500 text-[11px]">{ui?.tagline || ''}</div>
+        </div>
+      </div>
+
+      {/* Price — dynamic offer price from DB with strikethrough */}
+      <div>
+        <div className="flex items-baseline gap-2">
+          <span className={`text-2xl font-black tracking-tight ${hasOffer ? 'text-emerald-400' : 'text-white'}`}>
+            ₹{rate.toLocaleString('en-IN')}
+          </span>
+          {hasOffer && (
+            <span className="text-sm text-slate-500 line-through">₹{dp.original.toLocaleString('en-IN')}</span>
+          )}
+          <span className="text-xs text-slate-500">
+            {planId === 'lifetime' ? 'once' : '/month'}
+          </span>
+        </div>
+        <div className="text-[11px] text-slate-500 mt-1 mb-3 h-4">{billed}</div>
+      </div>
+
+      {/* Features — use DB features if available, else hardcoded */}
+      <ul className="space-y-2.5 flex-1 mb-5">
+        {(dp.dbFeatures || plan?.features || []).map((f, fi) => (
+          <li key={fi} className="flex items-start gap-2 text-xs text-slate-300">
+            <Check className="w-3.5 h-3.5 mt-0.5 text-emerald-400 flex-shrink-0" />
+            <span>{f}</span>
+          </li>
+        ))}
+      </ul>
+
+      {/* CTA */}
+      <PlanButton
+        planId={planId}
+        cta={ui?.cta || 'Upgrade'}
+        isCurrent={isCurrent}
+        isBusy={isBusy}
+        busyStage={phase?.stage}
+        disabled={!!phase}
+        onPay={onPay}
+        hasActivePlan={hasActivePlan}
+        suspended={shopStatus === 'suspended'}
+      />
+    </motion.div>
+  );
+}
+
+// (not used further; kept to preserve section spacing)
+
+
+/* ------------------------------------------------------------------ */
 /* Current plan banner — REAL plan, expiry & live usage                */
 /* ------------------------------------------------------------------ */
 function CurrentPlanBanner({ shopName, currentPlan, currentExpiry, planStatusText, usage, shopId, daysLeft }) {
-  const planId = currentPlan || 'free';
+  const planId = normalizePlanId(currentPlan);
   const plan = PLANS[planId];
-  const ui = PLAN_UI[planId];
+  const ui = planUiFor(planId);
 
   const isFree = planId === 'free';
   const isLifetime = planId === 'lifetime';
@@ -554,8 +702,8 @@ function CurrentPlanBanner({ shopName, currentPlan, currentExpiry, planStatusTex
       initial={{ opacity: 0, y: 10 }}
       animate={{ opacity: 1, y: 0 }}
       className={`relative overflow-hidden rounded-2xl border p-5 transition-colors ${expired
-          ? 'border-red-500/30 bg-gradient-to-r from-[#0B132B] via-[#1E293B] to-[#0B132B]'
-          : 'border-cyan-500/25 bg-gradient-to-r from-[#0B132B] via-[#1E293B] to-[#0B132B]'
+        ? 'border-red-500/30 bg-gradient-to-r from-[#0B132B] via-[#1E293B] to-[#0B132B]'
+        : 'border-cyan-500/25 bg-gradient-to-r from-[#0B132B] via-[#1E293B] to-[#0B132B]'
         }`}
     >
       <div aria-hidden="true" className="absolute -right-10 -top-10 w-48 h-48 rounded-full bg-cyan-500/10 blur-3xl" />
@@ -566,8 +714,8 @@ function CurrentPlanBanner({ shopName, currentPlan, currentExpiry, planStatusTex
             <h2 className="text-white font-bold text-base">{shopName || 'Your Shop'}</h2>
             <span
               className={`inline-flex items-center gap-1 text-[10px] font-extrabold uppercase px-2 py-0.5 rounded-full border ${expired
-                  ? 'bg-red-500/15 text-red-400 border-red-500/30'
-                  : 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30'
+                ? 'bg-red-500/15 text-red-400 border-red-500/30'
+                : 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30'
                 }`}
             >
               {!expired && (
@@ -580,9 +728,11 @@ function CurrentPlanBanner({ shopName, currentPlan, currentExpiry, planStatusTex
             </span>
           </div>
           <div className="flex items-center gap-1.5 text-xs text-slate-400">
-            <ui.icon className={`w-3.5 h-3.5 ${ui.accent}`} />
-            {plan.name} Plan
-            {planId !== 'lifetime' && plan.monthly > 0 && ` · ₹${plan.monthly.toLocaleString('en-IN')}/month`}
+            {ui?.icon
+              ? (React.createElement(ui.icon, { className: `w-3.5 h-3.5 ${ui?.accent || 'text-slate-400'}` }))
+              : <Sparkles className="w-3.5 h-3.5 text-slate-400" />}
+            {plan?.name || capitalize(planId)} Plan
+            {planId !== 'lifetime' && Number(plan?.monthly ?? 0) > 0 && ` · ₹${Number(plan.monthly).toLocaleString('en-IN')}/month`}
           </div>
           <div className="flex items-center gap-1.5 text-xs text-slate-500 mt-1">
             <RefreshCw className="w-3 h-3" />
@@ -594,13 +744,13 @@ function CurrentPlanBanner({ shopName, currentPlan, currentExpiry, planStatusTex
         <div className="lg:col-span-2 grid grid-cols-1 sm:grid-cols-3 gap-4">
           <UsageMeter
             label="Orders this month"
-            display={`${usage.ordersThisMonth}${isFree ? ' / 50' : isLifetime || planId === 'pro' || planId === 'advance' ? '' : ' / 500'}`}
-            pct={isFree ? Math.min(100, (usage.ordersThisMonth / 50) * 100) : 0}
+            display={`${usage?.ordersThisMonth ?? 0}${isFree ? ' / 50' : isLifetime || planId === 'pro' || planId === 'advance' ? '' : ' / 500'}`}
+            pct={isFree ? Math.min(100, ((usage?.ordersThisMonth ?? 0) / 50) * 100) : 0}
             icon={TrendingUp}
           />
           <UsageMeter
             label="Pages printed"
-            display={usage.pagesThisMonth.toLocaleString('en-IN')}
+            display={(usage?.pagesThisMonth ?? 0).toLocaleString('en-IN')}
             pct={0}
             icon={FileTextIcon}
           />
@@ -669,7 +819,8 @@ function UsageMeter({ label, display, pct, icon: Icon }) {
 /* ------------------------------------------------------------------ */
 /* CTA button                                                          */
 /* ------------------------------------------------------------------ */
-function PlanButton({ planId, cta, isCurrent, isBusy, busyStage, disabled, onPay, hasActivePlan }) {
+function PlanButton({ planId, cta, isCurrent, isBusy, busyStage, disabled, onPay, hasActivePlan, suspended = false }) {
+  const ui = planUiFor(planId);
   if (isCurrent) {
     return (
       <button
@@ -682,7 +833,7 @@ function PlanButton({ planId, cta, isCurrent, isBusy, busyStage, disabled, onPay
     );
   }
   if (isBusy) {
-    const label = busyStage === 'verifying' ? 'Verifying payment and upgrading your account...' : busyStage === 'checkout' ? 'Complete payment in popup…' : 'Creating order…';
+    const label = busyStage === 'verifying' ? 'Verifying payment...' : busyStage === 'checkout' ? 'Complete payment in popup…' : 'Creating order…';
     return (
       <button
         disabled
@@ -693,6 +844,18 @@ function PlanButton({ planId, cta, isCurrent, isBusy, busyStage, disabled, onPay
       </button>
     );
   }
+  if (suspended) {
+    return (
+      <button
+        disabled
+        title="Shop is suspended — renew through support to re-enable purchases"
+        className="w-full flex items-center justify-center gap-1.5 py-2.5 rounded-xl text-xs font-bold border border-amber-500/30 bg-amber-500/5 text-amber-300/70 cursor-not-allowed"
+      >
+        <AlertCircle className="w-3.5 h-3.5" />
+        Shop suspended
+      </button>
+    );
+  }
   return (
     <motion.button
       whileHover={{ scale: disabled ? 1 : 1.02 }}
@@ -700,12 +863,12 @@ function PlanButton({ planId, cta, isCurrent, isBusy, busyStage, disabled, onPay
       onClick={onPay}
       disabled={disabled}
       className={`w-full flex items-center justify-center gap-1.5 py-2.5 rounded-xl text-xs font-bold transition-colors ${disabled
-          ? 'bg-[#1E2D4A]/50 text-slate-500 border border-slate-600/30 cursor-not-allowed'
-          : PLAN_UI[planId].offer
-            ? 'bg-gradient-to-r from-cyan-500 to-teal-500 text-white shadow-[0_0_15px_rgba(245,158,11,0.3)]'
-            : PLAN_UI[planId].popular
-              ? 'bg-gradient-to-r from-cyan-500 to-blue-600 text-white shadow-[0_0_15px_rgba(6,182,212,0.3)]'
-              : 'bg-[#1E2D4A] text-slate-200 hover:bg-slate-600/60 border border-slate-600/40'
+        ? 'bg-[#1E2D4A]/50 text-slate-500 border border-slate-600/30 cursor-not-allowed'
+        : ui?.offer
+          ? 'bg-gradient-to-r from-cyan-500 to-teal-500 text-white shadow-[0_0_15px_rgba(245,158,11,0.3)]'
+          : ui?.popular
+            ? 'bg-gradient-to-r from-cyan-500 to-blue-600 text-white shadow-[0_0_15px_rgba(6,182,212,0.3)]'
+            : 'bg-[#1E2D4A] text-slate-200 hover:bg-slate-600/60 border border-slate-600/40'
         }`}
     >
       <ArrowUpRight className="w-3.5 h-3.5" />
@@ -717,7 +880,7 @@ function PlanButton({ planId, cta, isCurrent, isBusy, busyStage, disabled, onPay
 /* ------------------------------------------------------------------ */
 /* Payment methods — honest, no fake saved cards                       */
 /* ------------------------------------------------------------------ */
-function PaymentMethods({ shopPhone = null }) {
+function PaymentMethods() {
   return (
     <section>
       <h3 className="text-sm font-bold text-white mb-3">Payment Methods</h3>
@@ -749,9 +912,11 @@ function PaymentMethods({ shopPhone = null }) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Invoice history — REAL rows from `subscriptions`; clean empty state */
+/* Invoice history — REAL rows from `subscriptions` (or the ledger);   */
+/* clean empty state                                                   */
 /* ------------------------------------------------------------------ */
 function InvoiceHistory({ invoices, loaded }) {
+  const rows = Array.isArray(invoices) ? invoices : [];
   return (
     <section>
       <h3 className="text-sm font-bold text-white mb-3">Invoice History</h3>
@@ -761,7 +926,7 @@ function InvoiceHistory({ invoices, loaded }) {
             <Loader2 className="w-4 h-4 animate-spin" />
             Loading invoices…
           </div>
-        ) : invoices.length === 0 ? (
+        ) : rows.length === 0 ? (
           <div className="py-10 text-center">
             <Inbox className="w-8 h-8 mx-auto mb-2 text-slate-600" />
             <p className="text-sm font-semibold text-slate-300">No billing history available</p>
@@ -770,10 +935,10 @@ function InvoiceHistory({ invoices, loaded }) {
             </p>
           </div>
         ) : (
-          invoices.map((inv, i) => (
+          rows.map((inv, i) => (
             <div
-              key={inv.id || `${inv.invoice_number}-${i}`}
-              className={`flex items-center justify-between px-4 py-3 ${i !== invoices.length - 1 ? 'border-b border-[#1E2D4A]' : ''}`}
+              key={inv?.id || `${inv?.invoice_number}-${i}`}
+              className={`flex items-center justify-between px-4 py-3 ${i !== rows.length - 1 ? 'border-b border-[#1E2D4A]' : ''}`}
             >
               <div className="flex items-center gap-3">
                 <div className={`w-8 h-8 rounded-lg border flex items-center justify-center ${i === 0 ? 'bg-cyan-500/10 border-cyan-500/30' : 'bg-[#0B132B] border-[#1E2D4A]'}`}>
@@ -781,29 +946,29 @@ function InvoiceHistory({ invoices, loaded }) {
                 </div>
                 <div>
                   <div className="text-xs font-semibold text-white">
-                    {inv.invoice_number || inv.id?.slice(0, 8)}
+                    {inv?.invoice_number || inv?.id?.slice(0, 8)}
                     <span className="ml-2 text-[10px] font-bold text-slate-500 uppercase">
-                      {String(inv.billing_cycle || 'monthly')}
+                      {String(inv?.billing_cycle || 'monthly')}
                     </span>
                   </div>
                   <div className="text-[11px] text-slate-500">
-                    {formatDate(inv.created_at)}
-                    {inv.plan_id ? ` · ${capitalize(inv.plan_id)} plan` : ''}
+                    {formatDate(inv?.created_at)}
+                    {inv?.plan_id ? ` · ${capitalize(inv.plan_id)} plan` : ''}
                   </div>
                 </div>
               </div>
               <div className="flex items-center gap-3">
                 <span className="text-sm font-bold text-white">
-                  ₹{Number(inv.amount_rupees ?? 0).toLocaleString('en-IN')}
+                  ₹{Number(inv?.amount_rupees ?? 0).toLocaleString('en-IN')}
                 </span>
                 <span
-                  className={`inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-full border capitalize ${String(inv.status) === 'paid'
-                      ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30'
-                      : 'bg-amber-500/15 text-amber-400 border-amber-500/30'
+                  className={`inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-full border capitalize ${String(inv?.status) === 'paid'
+                    ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30'
+                    : 'bg-amber-500/15 text-amber-400 border-amber-500/30'
                     }`}
                 >
-                  {String(inv.status) === 'paid' && <Check className="w-3 h-3" />}
-                  {String(inv.status || 'pending')}
+                  {String(inv?.status) === 'paid' && <Check className="w-3 h-3" />}
+                  {String(inv?.status || 'pending')}
                 </span>
               </div>
             </div>
@@ -818,7 +983,8 @@ function InvoiceHistory({ invoices, loaded }) {
 /* Success modal                                                       */
 /* ------------------------------------------------------------------ */
 function SuccessModal({ tx, renewalDate, onClose, onBackToDashboard }) {
-  const plan = PLANS[tx.planId];
+  const plan = PLANS[tx?.planId] || { name: capitalize(tx?.planId || 'plan'), monthly: 0, yearly: 0, lifetime: 0 };
+  const amount = Number(tx?.amount ?? 0);
   return (
     <motion.div
       initial={{ opacity: 0 }}
@@ -859,19 +1025,19 @@ function SuccessModal({ tx, renewalDate, onClose, onBackToDashboard }) {
             <h3 className="text-lg font-black text-white tracking-tight">Subscription Activated!</h3>
           </div>
           <p className="text-xs text-slate-400 mt-1">
-            Your QRKraft plan is now live{tx.demo ? ' (demo mode)' : ''}
+            Your QRKraft plan is now live{tx?.demo ? ' (demo mode)' : ''}
           </p>
         </div>
 
         <div className="px-5 py-4 space-y-2.5">
           <ReceiptRow label="Plan" value={plan.name} />
-          {tx.cycle === 'monthly' && <ReceiptRow label="Billing Cycle" value="Monthly" />}
-          {tx.cycle === 'yearly' && <ReceiptRow label="Billing Cycle" value="Yearly" />}
-          {tx.cycle === 'lifetime' && <ReceiptRow label="Billing Cycle" value="Lifetime — never renews" />}
-          <ReceiptRow label="Amount Paid" value={`₹${tx.amount.toLocaleString('en-IN')}`} strong />
-          <ReceiptRow label="Transaction ID" value={tx.txId} mono />
+          {tx?.cycle === 'monthly' && <ReceiptRow label="Billing Cycle" value="Monthly" />}
+          {tx?.cycle === 'yearly' && <ReceiptRow label="Billing Cycle" value="Yearly" />}
+          {tx?.cycle === 'lifetime' && <ReceiptRow label="Billing Cycle" value="Lifetime — never renews" />}
+          <ReceiptRow label="Amount Paid" value={`₹${amount.toLocaleString('en-IN')}`} strong />
+          <ReceiptRow label="Transaction ID" value={tx?.txId || '—'} mono />
           <ReceiptRow label="Payment Method" value="UPI · Razorpay" />
-          {renewalDate && <ReceiptRow label={tx.planId === 'lifetime' ? 'Valid Until' : 'Next Renewal'} value={renewalDate} />}
+          {renewalDate && <ReceiptRow label={tx?.planId === 'lifetime' ? 'Valid Until' : 'Next Renewal'} value={renewalDate} />}
         </div>
 
         <div className="px-5 pb-5">
@@ -890,27 +1056,66 @@ function SuccessModal({ tx, renewalDate, onClose, onBackToDashboard }) {
   );
 }
 
-function ReceiptRow({ label, value, strong, mono }) {
-  return (
-    <div className="flex items-center justify-between text-xs">
-      <span className="text-slate-500">{label}</span>
-      <span className={`text-slate-100 ${strong ? 'font-black text-base text-white' : 'font-semibold'} ${mono ? 'font-mono text-[11px] tracking-wide' : ''}`}>
-        {value}
-      </span>
-    </div>
-  );
-}
+/* -------------------------------------------------------------------------- */
+/* Invoice/ledger helpers — module scope (used by loadBillingData)            */
+/* -------------------------------------------------------------------------- */
 
-/* ------------------------------------------------------------------ */
-function formatDate(iso) {
-  if (!iso) return null;
-  try {
-    return new Date(iso).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
-  } catch {
-    return null;
+/**
+ * Normalize either a `subscriptions` row or a `wallet_transactions` ledger row
+ * into the invoice shape InvoiceHistory renders. `subscriptions` rows pass
+ * through unchanged; ledger rows get their schema-specific fields mapped.
+ */
+function toInvoice(row) {
+  if (!row || typeof row !== 'object') return null;
+  /* A `subscriptions` row already carries the invoice columns. */
+  if (row.plan_id !== undefined || row.invoice_number !== undefined || row.amount_rupees !== undefined) {
+    return {
+      id: row.id,
+      invoice_number: row.invoice_number || null,
+      plan_id: row.plan_id || null,
+      billing_cycle: row.billing_cycle || null,
+      amount_rupees: row.amount_rupees ?? null,
+      status: row.status || 'paid',
+      created_at: row.created_at || null,
+    };
   }
+  /* A `wallet_transactions` row — repayment ledger against subscription id? */
+  return {
+    id: row.id,
+    invoice_number: row.reference_id || null,
+    plan_id: null, // ledger rows don't carry it; the UI hides it when null
+    billing_cycle: row.type || null,
+    amount_rupees: Number(row.amount ?? 0) || 0,
+    status: row.status === 'success' ? 'paid' : row.status || 'pending',
+    created_at: row.created_at || null,
+  };
 }
 
-function capitalize(s) {
-  return String(s || '').charAt(0).toUpperCase() + String(s || '').slice(1);
+/**
+ * Fallback invoice source: the applied-payment ledger. On the live deployment
+ * `subscriptions` can be missing while `wallet_transactions` exists and its
+ * `description` already says "<Plan> (Monthly) subscription · shop <id> ·
+ * payment <pid>" (lib/subscriptionService ledgerDescription). Scoping by the
+ * description fragment keeps the lookup owner-scoped without relying on a
+ * shop_id column that this table does not have.
+ */
+async function fetchLedgerInvoices(shopId) {
+  if (!isSupabaseConfigured || !supabase || !shopId) return [];
+  try {
+    const { data, error } = await supabase
+      .from('wallet_transactions')
+      .select('id, amount, type, description, status, created_at')
+      .like('description', `*shop ${shopId}*`)
+      .like('description', `*subscription*`)
+      .order('created_at', { ascending: false })
+      .limit(50);
+    if (error) {
+      console.warn('[billing] ledger query failed — invoices shown as empty:', error?.message || error);
+      return [];
+    }
+    return (data || []).map(toInvoice).filter(Boolean);
+  } catch (ledgerErr) {
+    console.warn('[billing] ledger query threw — invoices shown as empty:', ledgerErr?.message || ledgerErr);
+    return [];
+  }
 }
