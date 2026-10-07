@@ -33,6 +33,21 @@ import { selectStrict } from '../../lib/supabaseSelect';
 
 
 const capitalize = (str) => typeof str === 'string' ? str.charAt(0).toUpperCase() + str.slice(1).toLowerCase() : '';
+
+
+const formatDate = (dateStr) => {
+  if (!dateStr) return 'N/A';
+  try {
+    return new Date(dateStr).toLocaleDateString('en-IN', {
+      day: 'numeric',
+      month: 'short',
+      year: 'numeric',
+    });
+  } catch (e) {
+    return String(dateStr);
+  }
+};
+
 /**
  * BillingContent — Billing & Subscription, REAL DATA ONLY.
  *
