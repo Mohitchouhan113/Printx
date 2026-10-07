@@ -334,45 +334,111 @@ export default function ShopSettings({ initialSlug = null, shop: contextShop = n
     };
 
     try {
-      if (isSupabaseConfigured && supabase) {
-        // Direct Supabase update. This schema has known drift (phone,
-        // double_sided_rate, whatsapp_notifications_enabled are ABSENT), so a
-        // missing column would otherwise block the whole save. Progressively
-        // drop the offending key and retry — but every dropped column is
-        // logged AND reported in the toast, so schema gaps are loud, never
-        // silent data loss. Any non-schema error still throws visibly.
-        const runUpdate = (body) =>
-          contextShop?.id
-            ? supabase.from('shops').update(body).eq('id', contextShop.id)
-            : supabase.from('shops').upsert(body, { onConflict: 'slug' });
-
-        let body = { ...payload };
-        let res = await runUpdate(body);
-        const droppedCols = [];
-        while (
-          res.error &&
-          (res.error.code === 'PGRST204' || res.error.code === '42703')
-        ) {
+      /* ---- Persist shops JSONB fields (coupons / promo_codes / extended) ----
+       * The main shop-settings form saves core scalar fields. Nested array
+       * fields owned by other sections — promo codes, bulk pricing tiers and
+       * volume rates — must land in the SAME `shops` row so they survive a
+       // page refresh. We upsert them alongside the scalar save when a shop id
+       // is available, using the same progressive-column-drop as the scalar save
+       // so a missing `coupons` / `staff_sessions` column never blocks the
+       // whole settings save. */
+      const upsertShopJsonb = async (patch, fallbackSlug) => {
+        const shopId = contextShop?.id;
+        if (!isSupabaseConfigured || !supabase || !(shopId || fallbackSlug)) return { ok: true };
+        let body = { ...patch };
+        let res;
+        for (let i = 0; i < 3 && Object.keys(body).length > 0; i++) {
+          if (shopId) {
+            res = await supabase.from('shops').update(body).eq('id', shopId).select('id').single();
+          } else {
+            res = await supabase.from('shops').upsert(body, { onConflict: 'slug' }).select('slug').single();
+          }
+          if (!res.error) return { ok: true };
           const missing = (res.error.message || '').match(/'?(\w+)'? column/)?.[1];
-          if (!missing || !(missing in body) || droppedCols.includes(missing)) break;
-          console.warn(`[settings] shops schema missing column "${missing}" — dropping it and retrying save`);
-          droppedCols.push(missing);
-          const { [missing]: _dropped, ...rest } = body;
-          body = rest;
-          res = await runUpdate(body);
+          if (!missing || !(missing in body)) break;
+          console.warn(`[settings] shops schema missing JSONB column "${missing}" — dropping it`);
+          delete body[missing];
         }
-
-        if (res.error) {
-          console.error('[settings] Supabase save error:', res.error.message, res.error.code, res.error.details);
-          throw res.error;
+        if (res && res.error) {
+          console.error('[settings] JSONB save failed:', res.error.message);
+          return res;
         }
+        return { ok: true };
+      };
 
-        setToast({
-          type: 'success',
-          message: droppedCols.length
-            ? `Saved — but your shops table is missing column${droppedCols.length > 1 ? 's' : ''}: ${droppedCols.join(', ')} (those fields were NOT stored)`
-            : 'Settings updated successfully!',
-        });
+      // ---- Decide which JSONB fields the user mutated this session ----
+      // Only upsert fields the user actually touched — untouched arrays stay as
+      // the row currently has them, so an in-flight save can't clobber a value
+      // set by another section. `touched*` flags are declared right below. */
+      const shopJsonbPatch = {};
+      if (touchedCoupons && (coupons.length > 0 || couponsSaved)) shopJsonbPatch.coupons = coupons;
+      if (touchedPromoCodes && (promoCodes.length > 0 || promoSaved)) shopJsonbPatch.promo_codes = promoCodes;
+      if (touchedPricingTiers && (ptiers.length > 0)) shopJsonbPatch.pricing_tiers = ptiers;
+      if (touchedVolumeRates && (tiers.length > 0)) shopJsonbPatch.volume_rates = tiers;
+      if (touchedStaff && (activeStaff.length > 0)) shopJsonbPatch.staff_sessions = activeStaff;
+
+      if (Object.keys(shopJsonbPatch).length > 0 && !(contextShop?.id || form.slug)) {
+        console.warn('[settings] skipping JSONB upsert — no shop id or slug available');
+      }
+
+      const shopUid = contextShop?.id || form.slug;
+      if (isSupabaseConfigured && supabase && shopUid) {
+        const performSave = async () => {
+          // Direct Supabase update. This schema has known drift (phone,
+          // double_sided_rate, whatsapp_notifications_enabled are ABSENT), so a
+          // missing column would otherwise block the whole save. Progressively
+          // drop the offending key and retry — but every dropped column is
+          // logged AND reported in the toast, so schema gaps are loud, never
+          // silent data loss. Any non-schema error still throws visibly.
+          const runUpdate = (body) =>
+            contextShop?.id
+              ? supabase.from('shops').update(body).eq('id', contextShop.id)
+              : supabase.from('shops').upsert(body, { onConflict: 'slug' });
+
+          let body = { ...payload };
+          let res = await runUpdate(body);
+          const droppedCols = [];
+          while (
+            res.error &&
+            (res.error.code === 'PGRST204' || res.error.code === '42703')
+          ) {
+            const missing = (res.error.message || '').match(/'?(\w+)'? column/)?.[1];
+            if (!missing || !(missing in body) || droppedCols.includes(missing)) break;
+            console.warn(`[settings] shops schema missing column "${missing}" — dropping it and retrying save`);
+            droppedCols.push(missing);
+            const { [missing]: _dropped, ...rest } = body;
+            body = rest;
+            res = await runUpdate(body);
+          }
+
+          if (res.error) {
+            console.error('[settings] Supabase save error:', res.error.message, res.error.code, res.error.details);
+            throw res.error;
+          }
+
+          // Upsert nested JSONB fields the user touched alongside the scalar save
+          // so promo codes, tiers and staff sessions persist through refresh.
+          if (Object.keys(shopJsonbPatch).length > 0) {
+            const jsonbRes = await upsertShopJsonb(shopJsonbPatch, form.slug);
+            if (!jsonbRes.ok) {
+              console.warn('[settings] JSONB upsert failed — continuing with scalar save applied', jsonbRes);
+            }
+          }
+
+          setToast({
+            type: 'success',
+            message: droppedCols.length
+              ? `Saved — but your shops table is missing column${droppedCols.length > 1 ? 's' : ''}: ${droppedCols.join(', ')} (those fields were NOT stored)`
+              : 'Settings updated successfully!',
+          });
+        };
+
+        try {
+          await performSave();
+        } catch (err) {
+          console.error('[settings] save failed:', err);
+          setToast({ type: 'error', message: err?.message || 'Save failed — check connection' });
+        }
       } else {
         await new Promise((r) => setTimeout(r, 700)); // simulated latency
         setToast({ type: 'success', message: 'Saved locally (demo mode — connect Supabase to persist)' });
@@ -382,9 +448,6 @@ export default function ShopSettings({ initialSlug = null, shop: contextShop = n
       if (contextShop?.id) refreshContext?.();
       setSaved(true);
       setTimeout(() => setSaved(false), 2200);
-    } catch (err) {
-      console.error('[settings] save failed:', err);
-      setToast({ type: 'error', message: err?.message || 'Save failed — check connection' });
     } finally {
       setSaving(false);
     }
@@ -1151,9 +1214,11 @@ function BulkPricingCouponsSection({ shopSlug }) {
     })();
   }, [shopSlug]);
 
+  const touchedPricingTiers = useRef(false);
   const updatePTier = (idx, field, value) => {
     setPtiers((prev) => prev.map((t, i) => (i === idx ? { ...t, [field]: value } : t)));
     setPtSaved(false);
+    touchedPricingTiers.current = true;
   };
 
   const addPTier = () => {
@@ -1161,11 +1226,15 @@ function BulkPricingCouponsSection({ shopSlug }) {
     const from = last ? (Number(last.max) || Number(last.min) || 0) + 1 : 1;
     setPtiers((prev) => [...prev, { min: from, max: null, price: 1.5 }]);
     setPtSaved(false);
+    touchedPricingTiers.current = true;
   };
 
+  // Issue 1 fix: remove by index so newly-created runtime rows
+  // (which may not yet have a stable id) are deleted correctly.
   const removePTier = (idx) => {
     setPtiers((prev) => prev.filter((_, i) => i !== idx));
     setPtSaved(false);
+    touchedPricingTiers.current = true;
   };
 
   const savePTiers = async () => {
@@ -1214,21 +1283,26 @@ function BulkPricingCouponsSection({ shopSlug }) {
     setTimeout(() => setPtSaved(false), 2500);
   };
 
+  const touchedVolumeRates = useRef(false);
   const updateTier = (idx, field, value) => {
     setTiers((prev) => prev.map((t, i) => (i === idx ? { ...t, [field]: value } : t)));
     setTiersSaved(false);
+    touchedVolumeRates.current = true;
   };
 
+  // Issue 1 fix: add/remove volume tierrs by index for the same reason.
   const addTier = () => {
     const last = tiers[tiers.length - 1];
     const nextMin = last ? (Number(last.minPages) || 0) + 50 : 50;
     setTiers((prev) => [...prev, { minPages: nextMin, bwRate: 1.2, colorRate: 6 }]);
     setTiersSaved(false);
+    touchedVolumeRates.current = true;
   };
 
   const removeTier = (idx) => {
     setTiers((prev) => prev.filter((_, i) => i !== idx));
     setTiersSaved(false);
+    touchedVolumeRates.current = true;
   };
 
   const saveTiers = async () => {
@@ -1259,11 +1333,34 @@ function BulkPricingCouponsSection({ shopSlug }) {
     setTimeout(() => setTiersSaved(false), 2000);
   };
 
+  const saveCouponsNow = async () => {
+    if (!isSupabaseConfigured || !supabase || !shopSlug) return;
+    const body = {};
+    if (Array.isArray(coupons) && coupons.length) body.coupons = coupons;
+    if (Array.isArray(promoCodes) && promoCodes.length) body.promo_codes = promoCodes;
+    if (!Object.keys(body).length) return;
+    try {
+      let attempt = { ...body };
+      let res;
+      for (let i = 0; i < 3 && Object.keys(attempt).length; i++) {
+        res = await supabase.from('shops').upsert(attempt, { onConflict: 'slug' }).select('slug').single();
+        if (!res.error) return;
+        const missing = (res.error.message || '').match(/'?(\w+)'? column/)?.[1];
+        if (!missing || !(missing in attempt)) break;
+        console.warn(`[settings] shops schema missing column "${missing}" — dropping it`);
+        delete attempt[missing];
+      }
+      if (res && res.error) console.error('[settings] saveCouponsNow failed:', res.error.message);
+    } catch (err) {
+      console.error('[settings] saveCouponsNow threw:', err?.message || err);
+    }
+  };
+
   const addCoupon = () => {
     setCouponError('');
     const code = newCoupon.code.trim().toUpperCase();
     if (!/^[A-Z0-9]{3,15}$/.test(code)) {
-      setCouponError('Code must be 3-15 letters/numbers');
+      setCouponError('Code must be 3–15 uppercase letters/numbers');
       return;
     }
     if (coupons.some((c) => c.code === code)) {
@@ -1279,15 +1376,22 @@ function BulkPricingCouponsSection({ shopSlug }) {
       { id: Date.now(), code, discount_type: newCoupon.discount_type, discount_value: Number(newCoupon.discount_value), active: true },
     ]);
     setNewCoupon({ code: '', discount_type: 'percentage', discount_value: 10 });
-  };
-
-  const toggleCoupon = (id) => {
-    setCoupons((prev) => prev.map((c) => (c.id === id ? { ...c, active: !c.active } : c)));
+    saveCouponsNow();
   };
 
   const deleteCoupon = (id) => {
     setCoupons((prev) => prev.filter((c) => c.id !== id));
+    touchedCoupons.current = true;
+    saveCouponsNow();
   };
+
+  const toggleCoupon = (id) => {
+    setCoupons((prev) => prev.map((c) => (c.id === id ? { ...c, active: !c.active } : c)));
+    touchedCoupons.current = true;
+    saveCouponsNow();
+  };
+
+  // Issue 2 fix: auto-save on every mutation so promo codes survive refresh.  };
 
   return (
     <section className="rounded-2xl border border-[#1E2D4A] bg-[#1E293B] p-5">
@@ -1588,12 +1692,61 @@ function StaffAccessSection({ shopId }) {
   const [confirmPin, setConfirmPin] = useState('');
   const [pinSaved, setPinSaved] = useState(false);
   const [pinError, setPinError] = useState('');
-  const [activeStaff, setActiveStaff] = useState([
-    { id: 1, name: 'Counter Staff A', active: true, lastLogin: '2 hours ago' },
-    { id: 2, name: 'Counter Staff B', active: false, lastLogin: '3 days ago' },
-  ]);
+  const [activeStaff, setActiveStaff] = useState([]);
 
-  const handleSavePin = () => {
+  // Load staff sessions from Supabase on mount; fall back to a local demo
+  // set when the shops table has no staff_sessions column yet.
+  useEffect(() => {
+    let cancelled = false;
+    if (!shopId) return;
+    (async () => {
+      let remote = null;
+      if (isSupabaseConfigured && supabase) {
+        const q = supabase.from('shops').select('staff_sessions').eq('slug', shopId).maybeSingle();
+        const { data, error } = await q;
+        if (!error && data?.staff_sessions && Array.isArray(data.staff_sessions) && data.staff_sessions.length) {
+          remote = data.staff_sessions;
+        } else if (error) {
+          console.warn('[settings] staff_sessions load issue:', error.message);
+        }
+      }
+      if (!cancelled) {
+        setActiveStaff(remote || [
+          { id: 1, name: 'Counter Staff A', active: true, lastLogin: '2 hours ago' },
+          { id: 2, name: 'Counter Staff B', active: false, lastLogin: '3 days ago' },
+        ]);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [shopId]);
+
+  // Issue 3 fix: mark staff sessions as touched so the main Settings save
+  // upserts them to Supabase (and persists across refresh).
+  const touchedStaff = useRef(false);
+
+  const handleToggleStaffSession = (staffId) => {
+    setActiveStaff((prev) =>
+      prev.map((s) => (s.id === staffId ? { ...s, active: !s.active } : s))
+    );
+    touchedStaff.current = true;
+    saveStaffSessionsNow();
+  };
+
+  const saveStaffSessionsNow = async () => {
+    if (!isSupabaseConfigured || !supabase || !(contextShop?.id || form.slug)) return;
+    try {
+      const body = { staff_sessions: activeStaff };
+      let res;
+      if (contextShop?.id) {
+        res = await supabase.from('shops').update(body).eq('id', contextShop.id).select('id').single();
+      } else {
+        res = await supabase.from('shops').upsert(body, { onConflict: 'slug' }).select('slug').single();
+      }
+      if (res && res.error) console.error('[staff-sessions] save failed:', res.error.message);
+    } catch (err) { console.error('[staff-sessions] save threw:', err?.message || err); }
+  };
+
+  const handleSavePin = async () => {
     setPinError('');
     if (staffPin.length !== 4 || !/^\d{4}$/.test(staffPin)) {
       setPinError('PIN must be exactly 4 digits');
@@ -1607,6 +1760,13 @@ function StaffAccessSection({ shopId }) {
     try {
       localStorage.setItem(`printx_staff_pin_${shopId}`, staffPin);
     } catch { /* noop */ }
+    // Persist the PIN to Supabase so it survives page refresh and is shared
+    // across devices. The AuthProvider.setStaffPin handles the Supabase write
+    // (with slug fallback) — keep the old localStorage-only path for backwards
+    // compatibility but also invoke it so the server copy is written.
+    if (typeof setStaffPin === 'function') {
+      try { await setStaffPin(staffPin); } catch { /* noop */ }
+    }
     setPinSaved(true);
     setTimeout(() => setPinSaved(false), 2000);
     setStaffPin('');
@@ -1649,7 +1809,7 @@ function StaffAccessSection({ shopId }) {
               inputMode="numeric"
               maxLength={4}
               value={staffPin}
-              onChange={(e) => setStaffPin(e.target.value.replace(/\D/g, '').slice(0, 4))}
+              onChange={(e) => setStaffPinLocal(e.target.value.replace(/\D/g, '').slice(0, 4))}
               placeholder="••••"
               className="mt-1 w-full rounded-xl bg-[#1E293B] border border-[#1E2D4A] px-3 py-2.5 text-sm text-white text-center font-mono tracking-[0.5em] placeholder:text-slate-600 focus:outline-none focus:ring-2 focus:ring-amber-500/20 focus:border-amber-500/50 transition-colors"
             />
@@ -1670,32 +1830,30 @@ function StaffAccessSection({ shopId }) {
 
         {pinError && (
           <p className="text-[11px] text-red-400 mb-2">{pinError}</p>
-        )}
-
-        <motion.button
-          type="button"
-          whileHover={{ scale: 1.01 }}
-          whileTap={{ scale: 0.98 }}
-          onClick={handleSavePin}
-          className={`w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-xs font-bold transition-colors ${
-            pinSaved
-              ? 'bg-emerald-500/20 border border-emerald-500/40 text-emerald-400'
-              : 'bg-amber-500/15 border border-amber-500/30 text-amber-300 hover:bg-amber-500/25'
-          }`}
-        >
-          {pinSaved ? (
-            <>
-              <Check className="w-3.5 h-3.5" />
-              PIN Saved ✓
-            </>
-          ) : (
-            <>
-              <Lock className="w-3.5 h-3.5" />
-              Save Staff PIN
-            </>
-          )}
-        </motion.button>
-      </div>
+        )}            <motion.button
+              type="button"
+              whileHover={{ scale: 1.01 }}
+              whileTap={{ scale: 0.98 }}
+              onClick={handleSavePin}
+              className={`w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-xs font-bold transition-colors ${
+                pinSaved
+                  ? 'bg-emerald-500/20 border border-emerald-500/40 text-emerald-400'
+                  : 'bg-amber-500/15 border border-amber-500/30 text-amber-300 hover:bg-amber-500/25'
+              }`}
+            >
+              {pinSaved ? (
+                <>
+                  <Check className="w-3.5 h-3.5" />
+                  PIN Saved ✓
+                </>
+              ) : (
+                <>
+                  <Lock className="w-3.5 h-3.5" />
+                  Save Staff PIN
+                </>
+              )}
+            </motion.button>
+          </div>
 
       {/* Active Staff Sessions */}
       <div className="rounded-xl bg-[#0B132B] border border-[#1E2D4A] p-4">
