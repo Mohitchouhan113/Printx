@@ -351,7 +351,7 @@ export default function ShopSettings({ initialSlug = null, shop: contextShop = n
           if (shopId) {
             res = await supabase.from('shops').update(body).eq('id', shopId).select('id').single();
           } else {
-            res = await supabase.from('shops').upsert(body, { onConflict: 'slug' }).select('slug').single();
+            res = await supabase.from('shops').update(body).eq('slug', fallbackSlug).select('slug').single();
           }
           if (!res.error) return { ok: true };
           const missing = (res.error.message || '').match(/'?(\w+)'? column/)?.[1];
@@ -387,7 +387,7 @@ export default function ShopSettings({ initialSlug = null, shop: contextShop = n
           const runUpdate = (body) =>
             contextShop?.id
               ? supabase.from('shops').update(body).eq('id', contextShop.id)
-              : supabase.from('shops').upsert(body, { onConflict: 'slug' });
+              : supabase.from('shops').update(body).eq('slug', form.slug.trim());
 
           let body = { ...payload };
           let res = await runUpdate(body);
@@ -1328,16 +1328,17 @@ function BulkPricingCouponsSection({ shopSlug }) {
     setTimeout(() => setTiersSaved(false), 2000);
   };
 
-  const saveCouponsNow = async () => {
+  const saveCouponsNow = async (latestCoupons) => {
     if (!isSupabaseConfigured || !supabase || !shopSlug) return;
+    const data = latestCoupons ?? coupons;
     const body = {};
-    if (Array.isArray(coupons) && coupons.length) body.coupons = coupons;
+    if (Array.isArray(data) && data.length) body.coupons = data;
     if (!Object.keys(body).length) return;
     try {
       let attempt = { ...body };
       let res;
       for (let i = 0; i < 3 && Object.keys(attempt).length; i++) {
-        res = await supabase.from('shops').upsert(attempt, { onConflict: 'slug' }).select('slug').single();
+        res = await supabase.from('shops').update(attempt).eq('slug', shopSlug).select('slug').single();
         if (!res.error) return;
         const missing = (res.error.message || '').match(/'?(\w+)'? column/)?.[1];
         if (!missing || !(missing in attempt)) break;
@@ -1365,27 +1366,30 @@ function BulkPricingCouponsSection({ shopSlug }) {
       setCouponError('Discount must be greater than 0');
       return;
     }
-    setCoupons((prev) => [
-      ...prev,
+    const updated = [
+      ...coupons,
       { id: Date.now(), code, discount_type: newCoupon.discount_type, discount_value: Number(newCoupon.discount_value), active: true },
-    ]);
+    ];
+    setCoupons(updated);
     setNewCoupon({ code: '', discount_type: 'percentage', discount_value: 10 });
-    saveCouponsNow();
+    saveCouponsNow(updated);
   };
 
   const deleteCoupon = (id) => {
-    setCoupons((prev) => prev.filter((c) => c.id !== id));
+    const updated = coupons.filter((c) => c.id !== id);
+    setCoupons(updated);
     touchedCoupons.current = true;
-    saveCouponsNow();
+    saveCouponsNow(updated);
   };
 
   const toggleCoupon = (id) => {
-    setCoupons((prev) => prev.map((c) => (c.id === id ? { ...c, active: !c.active } : c)));
+    const updated = coupons.map((c) => (c.id === id ? { ...c, active: !c.active } : c));
+    setCoupons(updated);
     touchedCoupons.current = true;
-    saveCouponsNow();
+    saveCouponsNow(updated);
   };
 
-  // Issue 2 fix: auto-save on every mutation so promo codes survive refresh.  };
+  // Issue 2 fix: auto-save on every mutation so promo codes survive refresh.
 
   return (
     <section className="rounded-2xl border border-[#1E2D4A] bg-[#1E293B] p-5">
@@ -1718,26 +1722,29 @@ function StaffAccessSection({ shopId }) {
   // upserts them to Supabase (and persists across refresh).
   const touchedStaff = useRef(false);
 
-  const handleToggleStaffSession = (staffId) => {
-    setActiveStaff((prev) =>
-      prev.map((s) => (s.id === staffId ? { ...s, active: !s.active } : s))
-    );
-    touchedStaff.current = true;
-    saveStaffSessionsNow();
-  };
-
-  const saveStaffSessionsNow = async () => {
+  const saveStaffSessionsNow = async (latestStaff) => {
     if (!isSupabaseConfigured || !supabase || !shopId) return;
+    const data = latestStaff ?? activeStaff;
     try {
-      const body = { staff_sessions: activeStaff };
-      const res = await supabase
-        .from('shops')
-        .update(body)
-        .eq('slug', shopId)
-        .select('slug')
-        .single();
+      let body = { staff_sessions: data };
+      let res;
+      for (let i = 0; i < 3 && Object.keys(body).length; i++) {
+        res = await supabase.from('shops').update(body).eq('slug', shopId).select('slug').single();
+        if (!res.error) return;
+        const missing = (res.error.message || '').match(/'?(\w+)'? column/)?.[1];
+        if (!missing || !(missing in body)) break;
+        console.warn(`[staff-sessions] shops schema missing column "${missing}" — dropping it`);
+        delete body[missing];
+      }
       if (res && res.error) console.error('[staff-sessions] save failed:', res.error.message);
     } catch (err) { console.error('[staff-sessions] save threw:', err?.message || err); }
+  };
+
+  const handleToggleStaffSession = (staffId) => {
+    const updated = activeStaff.map((s) => (s.id === staffId ? { ...s, active: !s.active } : s));
+    setActiveStaff(updated);
+    touchedStaff.current = true;
+    saveStaffSessionsNow(updated);
   };
 
   const handleSavePin = async () => {
