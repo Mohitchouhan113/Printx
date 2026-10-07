@@ -29,6 +29,10 @@ import { supabase, isSupabaseConfigured } from '../../lib/supabaseClient';
 import { fetchPlans, planIsActive } from '../../lib/plansStore';
 import { selectStrict } from '../../lib/supabaseSelect';
 
+
+
+
+const capitalize = (str) => typeof str === 'string' ? str.charAt(0).toUpperCase() + str.slice(1).toLowerCase() : '';
 /**
  * BillingContent — Billing & Subscription, REAL DATA ONLY.
  *
