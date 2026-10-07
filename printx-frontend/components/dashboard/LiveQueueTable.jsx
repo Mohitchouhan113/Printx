@@ -1205,9 +1205,9 @@ export default function LiveQueueTable({ shopId = null, initialOrders = [], onNe
                         </span>
                       </div>
                       {order.notes && (
-                        <div className="mt-1.5 inline-flex items-start gap-1 max-w-xs">
-                          <span className="text-[10px] leading-snug text-amber-300/90 bg-amber-500/10 border border-amber-500/25 rounded-md px-2 py-0.5 font-medium line-clamp-2" title={order.notes}>
-                            📝 {order.notes}
+                        <div className="mt-1">
+                          <span className="mt-1 bg-amber-500/10 border border-amber-500/30 text-amber-300 text-xs px-2.5 py-1 rounded-md font-medium inline-flex items-center gap-1.5">
+                            📝 Note: &quot;{order.notes}&quot;
                           </span>
                         </div>
                       )}
@@ -1440,7 +1440,7 @@ function normalizeJob(job = {}) {
     status: canonStatus(rawStatus),
     auto_printed: job.auto_printed || false,
     created_at: job.created_at || new Date().toISOString(),
-    notes: job.notes || null,
+    notes: job.notes || job.special_instructions || null,
   };
 }
 
@@ -1488,23 +1488,28 @@ function EditSpecsModal({ order, onClose, onSaved }) {
   const handleSave = async () => {
     setSaving(true);
     setError('');
-    const patch = {
-      paper_size: paperSize,
-      color_mode: colorMode,
-      sides,
-      page_count: Number(pageCount) || 1,
-      copies: Number(copies) || 1,
-      total_price: totalPrice !== '' && totalPrice !== null ? Number(totalPrice) : null,
-    };
+
+    // Build patch only from fields the user actually set — avoids writing
+    // null into columns that may not exist or weren't touched.
+    const updateData = {};
+    if (paperSize)   updateData.paper_size  = paperSize;
+    if (colorMode)   updateData.color_mode  = colorMode;
+    if (sides)       updateData.sides       = sides;
+    if (pageCount)   updateData.page_count  = Number(pageCount) || 1;
+    if (copies)      updateData.copies      = Number(copies) || 1;
+    if (totalPrice !== '' && totalPrice !== null && totalPrice !== undefined)
+                     updateData.total_price = Number(totalPrice);
+
     try {
-      if (isSupabaseConfigured && supabase && order.id) {
+      if (isSupabaseConfigured && supabase && order.id && Object.keys(updateData).length > 0) {
         const { error: supaErr } = await supabase
           .from('orders')
-          .update(patch)
+          .update(updateData)
           .eq('id', order.id);
         if (supaErr) throw supaErr;
       }
-      onSaved(order.id, patch);
+      // Patch local state with what we sent (+ numeric coercions already applied)
+      onSaved(order.id, updateData);
     } catch (err) {
       setError(err?.message || 'Save failed — check connection');
       setSaving(false);
@@ -1552,11 +1557,13 @@ function EditSpecsModal({ order, onClose, onSaved }) {
           </button>
         </div>
 
-        {/* Customer note — read-only callout */}
+        {/* Customer note — prominent callout banner */}
         {order.notes && (
-          <div className="mx-5 mt-4 px-3.5 py-2.5 rounded-xl bg-amber-500/10 border border-amber-500/25 flex items-start gap-2">
-            <span className="text-amber-400 text-sm leading-none mt-0.5">📝</span>
-            <p className="text-xs text-amber-200 leading-relaxed">{order.notes}</p>
+          <div className="mx-5 mt-4 px-4 py-3 rounded-xl bg-amber-500/15 border border-amber-500/40 shadow-[0_0_14px_rgba(245,158,11,0.15)]">
+            <div className="flex items-center gap-1.5 text-[10px] font-black uppercase tracking-wider text-amber-400 mb-1">
+              <span>📝</span> Customer Request
+            </div>
+            <p className="text-sm text-amber-200 font-semibold leading-snug">&quot;{order.notes}&quot;</p>
           </div>
         )}
 

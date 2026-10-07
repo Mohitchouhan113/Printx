@@ -236,7 +236,7 @@ function fileSplit(item, rates, range) {
 /* Default file config                                                 */
 /* ------------------------------------------------------------------ */
 function defaultFileConfig() {
-  return { colorMode: 'auto', sides: 'single', copies: 1 };
+  return { colorMode: 'auto', sides: 'single', copies: 1, colorPagesNote: '' };
 }
 
 /* ------------------------------------------------------------------ */
@@ -996,7 +996,16 @@ export default function ShopUploadPage({ params }) {
       fd.append('pageRange', pageRangeValue);
 
       // Special instructions from the customer (orders.notes)
-      fd.append('notes', notes.trim());
+      // Merge per-file color-page notes (from FileConfigCard) with the global notes field.
+      const colorNotes = filesList
+        .map((item, idx) => {
+          const cn = (item.config.colorPagesNote || '').trim();
+          return cn ? (filesList.length > 1 ? `File ${idx + 1}: ${cn}` : cn) : null;
+        })
+        .filter(Boolean)
+        .join('; ');
+      const combinedNotes = [notes.trim(), colorNotes].filter(Boolean).join(' | ');
+      fd.append('notes', combinedNotes);
 
       // Smart AI color split — explicit totals → orders.bw_pages / color_pages
       fd.append('bwPages', String(rawPages.totalBwPages));
@@ -2811,6 +2820,23 @@ function FileConfigCard({ item, index, onRemove, onUpdateConfig, rates }) {
             })}
           </div>
         </div>
+
+        {/* Color-specific page instructions — shown for Auto AI Scan (mixed docs) */}
+        {config.colorMode === 'auto' && (
+          <div>
+            <label className="block text-[11px] font-bold text-slate-500 uppercase tracking-wide mb-1.5">
+              Which pages need Full Color?{' '}
+              <span className="normal-case font-normal text-slate-600">(optional)</span>
+            </label>
+            <input
+              type="text"
+              value={config.colorPagesNote || ''}
+              onChange={(e) => onUpdateConfig({ colorMode: 'auto', colorPagesNote: e.target.value })}
+              placeholder="e.g. Page 1 color, rest B&W"
+              className="w-full rounded-xl bg-[#0B132B] border border-[#1E2D4A] px-3.5 py-2.5 text-sm text-white placeholder-slate-600 focus:outline-none focus:border-amber-500/50 focus:ring-2 focus:ring-amber-500/15 transition-colors"
+            />
+          </div>
+        )}
 
         {/* Sides + Copies row */}
         <div className="grid grid-cols-2 gap-3">
