@@ -366,16 +366,10 @@ export default function ShopSettings({ initialSlug = null, shop: contextShop = n
         return { ok: true };
       };
 
-      // ---- Decide which JSONB fields the user mutated this session ----
-      // Only upsert fields the user actually touched — untouched arrays stay as
-      // the row currently has them, so an in-flight save can't clobber a value
-      // set by another section. `touched*` flags are declared right below. */
+      // ---- JSONB fields (coupons, tiers, staff) are saved directly by their
+      // own sub-sections via saveCouponsNow / saveTiers / saveStaffSessionsNow.
+      // The main save only writes the scalar shop fields above.
       const shopJsonbPatch = {};
-      if (touchedCoupons && (coupons.length > 0 || couponsSaved)) shopJsonbPatch.coupons = coupons;
-      if (touchedPromoCodes && (promoCodes.length > 0 || promoSaved)) shopJsonbPatch.promo_codes = promoCodes;
-      if (touchedPricingTiers && (ptiers.length > 0)) shopJsonbPatch.pricing_tiers = ptiers;
-      if (touchedVolumeRates && (tiers.length > 0)) shopJsonbPatch.volume_rates = tiers;
-      if (touchedStaff && (activeStaff.length > 0)) shopJsonbPatch.staff_sessions = activeStaff;
 
       if (Object.keys(shopJsonbPatch).length > 0 && !(contextShop?.id || form.slug)) {
         console.warn('[settings] skipping JSONB upsert — no shop id or slug available');
@@ -1214,6 +1208,7 @@ function BulkPricingCouponsSection({ shopSlug }) {
     })();
   }, [shopSlug]);
 
+  const touchedCoupons = useRef(false);
   const touchedPricingTiers = useRef(false);
   const updatePTier = (idx, field, value) => {
     setPtiers((prev) => prev.map((t, i) => (i === idx ? { ...t, [field]: value } : t)));
@@ -1337,7 +1332,6 @@ function BulkPricingCouponsSection({ shopSlug }) {
     if (!isSupabaseConfigured || !supabase || !shopSlug) return;
     const body = {};
     if (Array.isArray(coupons) && coupons.length) body.coupons = coupons;
-    if (Array.isArray(promoCodes) && promoCodes.length) body.promo_codes = promoCodes;
     if (!Object.keys(body).length) return;
     try {
       let attempt = { ...body };
@@ -1733,15 +1727,15 @@ function StaffAccessSection({ shopId }) {
   };
 
   const saveStaffSessionsNow = async () => {
-    if (!isSupabaseConfigured || !supabase || !(contextShop?.id || form.slug)) return;
+    if (!isSupabaseConfigured || !supabase || !shopId) return;
     try {
       const body = { staff_sessions: activeStaff };
-      let res;
-      if (contextShop?.id) {
-        res = await supabase.from('shops').update(body).eq('id', contextShop.id).select('id').single();
-      } else {
-        res = await supabase.from('shops').upsert(body, { onConflict: 'slug' }).select('slug').single();
-      }
+      const res = await supabase
+        .from('shops')
+        .update(body)
+        .eq('slug', shopId)
+        .select('slug')
+        .single();
       if (res && res.error) console.error('[staff-sessions] save failed:', res.error.message);
     } catch (err) { console.error('[staff-sessions] save threw:', err?.message || err); }
   };
@@ -1809,7 +1803,7 @@ function StaffAccessSection({ shopId }) {
               inputMode="numeric"
               maxLength={4}
               value={staffPin}
-              onChange={(e) => setStaffPinLocal(e.target.value.replace(/\D/g, '').slice(0, 4))}
+              onChange={(e) => setStaffPin(e.target.value.replace(/\D/g, '').slice(0, 4))}
               placeholder="••••"
               className="mt-1 w-full rounded-xl bg-[#1E293B] border border-[#1E2D4A] px-3 py-2.5 text-sm text-white text-center font-mono tracking-[0.5em] placeholder:text-slate-600 focus:outline-none focus:ring-2 focus:ring-amber-500/20 focus:border-amber-500/50 transition-colors"
             />
