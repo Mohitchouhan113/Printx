@@ -16,10 +16,7 @@ import {
   AlertCircle,
   Check,
   FileText,
-  Settings2,
-  Save,
 } from 'lucide-react';
-import { supabase, isSupabaseConfigured } from '../../../lib/supabaseClient';
 
 /**
  * QueueTable — tabbed, filterable order queue for the vendor dashboard.
@@ -33,7 +30,6 @@ export default function QueueTable({ orders, compact = false, autoPrint = false 
   const [statusMenu, setStatusMenu] = useState(null);
   const [updatingId, setUpdatingId] = useState(null);
   const [preview, setPreview] = useState(null);
-  const [editOrder, setEditOrder] = useState(null);
   const [toast, setToast] = useState(null);
   const socketRef = useRef(null);
   const [rows, setRows] = useState(() => (orders || []).map(normalizeOrder));
@@ -86,17 +82,7 @@ export default function QueueTable({ orders, compact = false, autoPrint = false 
       });
   }, [rows, tab, query, date]);
 
-  // Callback: specs modal saved — patch the local row and show toast
-  const handleSpecsSaved = useCallback((orderId, patch) => {
-    setRows((prev) =>
-      prev.map((o) => (o.id === orderId ? { ...o, ...patch } : o))
-    );
-    setEditOrder(null);
-    setToast({ type: 'success', message: 'Order specs updated' });
-  }, []);
-
-  // REST fallback for status updates
-  const apiUpdateStatus = useCallback(async (order_id, newStatus) => {
+  // REST fallback for status updates  const apiUpdateStatus = useCallback(async (order_id, newStatus) => {
     const res = await fetch('http://localhost:3000/api/v1/orders/update-status', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -300,13 +286,6 @@ export default function QueueTable({ orders, compact = false, autoPrint = false 
                       <td className="px-4 py-3.5">
                         <div className="text-white font-bold text-sm">{order.name}</div>
                         <div className="text-slate-400 text-xs mt-0.5">{order.phone}</div>
-                        {order.notes && (
-                          <div className="mt-1.5 flex items-start gap-1 max-w-[180px]">
-                            <span className="text-[10px] leading-tight text-amber-300/80 bg-amber-500/10 border border-amber-500/20 rounded-md px-1.5 py-0.5 font-medium truncate" title={order.notes}>
-                              📝 {order.notes}
-                            </span>
-                          </div>
-                        )}
                       </td>
                       {/* Page specs + amount */}
                       <td className="px-4 py-3.5 hidden md:table-cell">
@@ -371,17 +350,6 @@ export default function QueueTable({ orders, compact = false, autoPrint = false 
                           <motion.button
                             whileHover={{ scale: 1.02 }}
                             whileTap={{ scale: 0.96 }}
-                            onClick={() => setEditOrder(order)}
-                            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-violet-500/15 hover:bg-violet-500/25 border border-violet-500/30 text-xs font-semibold text-violet-300 transition-colors"
-                            title="Edit order specs"
-                          >
-                            <Settings2 className="w-3.5 h-3.5" />
-                            <span className="hidden xl:inline">Edit Specs</span>
-                          </motion.button>
-
-                          <motion.button
-                            whileHover={{ scale: 1.02 }}
-                            whileTap={{ scale: 0.96 }}
                             onClick={() => setPreview({ file_url: order.file_url, tokenNo: order.tokenNumber || order.id })}
                             className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-blue-500/15 hover:bg-blue-500/25 border border-blue-500/30 text-xs font-semibold text-blue-300 transition-colors"
                             title="Print now"
@@ -425,17 +393,6 @@ export default function QueueTable({ orders, compact = false, autoPrint = false 
       {/* Print preview modal */}
       <AnimatePresence>
         {preview && <PreviewModal fileUrl={preview.file_url} tokenNo={preview.token_no} onClose={() => setPreview(null)} />}
-      </AnimatePresence>
-
-      {/* Edit specs modal */}
-      <AnimatePresence>
-        {editOrder && (
-          <EditSpecsModal
-            order={editOrder}
-            onClose={() => setEditOrder(null)}
-            onSaved={handleSpecsSaved}
-          />
-        )}
       </AnimatePresence>
     </div>
   );
@@ -530,7 +487,7 @@ function timeAgo(iso) {
 
 /**
  * Normalize an order to the standardized UI shape:
- * { id, tokenNumber, name, phone, details, amount, status, paidStatus, file_url, created_at, notes }
+ * { id, tokenNumber, name, phone, details, amount, status, paidStatus, file_url, created_at }
  * Accepts both the new standardized keys and the legacy backend keys.
  */
 function normalizeOrder(o = {}) {
@@ -547,217 +504,5 @@ function normalizeOrder(o = {}) {
     amount: o.amount || '',
     status,
     paidStatus: o.paidStatus || (o.payment_status === 'PAID' ? 'PAID' : 'PENDING'),
-    notes: o.notes || o.special_instructions || null,
   };
-}
-
-/* ------------------------------------------------------------------ */
-/* Edit Specs Modal                                                     */
-/* ------------------------------------------------------------------ */
-const PAPER_SIZES = ['A4', 'A3', 'Legal', 'Letter', 'A5', 'B5'];
-const COLOR_MODES = [
-  { value: 'bw', label: 'B&W (Black & White)' },
-  { value: 'color', label: 'Full Color' },
-  { value: 'mixed', label: 'Mixed / Custom' },
-];
-const SIDES_OPTIONS = [
-  { value: 'single', label: 'Single-Sided (Simplex)' },
-  { value: 'double', label: 'Double-Sided (Duplex)' },
-];
-
-function EditSpecsModal({ order, onClose, onSaved }) {
-  const [paperSize, setPaperSize] = useState(order.paper_size || 'A4');
-  const [colorMode, setColorMode] = useState(order.color_mode || 'bw');
-  const [sides, setSides] = useState(order.sides || 'single');
-  const [pageCount, setPageCount] = useState(order.page_count ?? order.total_pages ?? 1);
-  const [copies, setCopies] = useState(order.copies ?? 1);
-  const [totalPrice, setTotalPrice] = useState(order.total_price ?? order.amount ?? '');
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState('');
-
-  const handleSave = async () => {
-    setSaving(true);
-    setError('');
-    const patch = {
-      paper_size: paperSize,
-      color_mode: colorMode,
-      sides,
-      page_count: Number(pageCount) || 1,
-      copies: Number(copies) || 1,
-      total_price: totalPrice !== '' ? Number(totalPrice) : null,
-    };
-
-    try {
-      if (isSupabaseConfigured && supabase && order.id) {
-        const { error: supaErr } = await supabase
-          .from('orders')
-          .update(patch)
-          .eq('id', order.id);
-        if (supaErr) throw supaErr;
-      }
-      onSaved(order.id, patch);
-    } catch (err) {
-      setError(err?.message || 'Save failed — check connection');
-      setSaving(false);
-    }
-  };
-
-  // Shared input class matching the dark queue theme
-  const inputCls = 'w-full bg-[#0B132B]/70 border border-[#1E2D4A] text-sm text-white rounded-xl px-3 py-2.5 focus:outline-none focus:border-[#06B6D4]/50 focus:ring-2 focus:ring-[#06B6D4]/20 transition-colors';
-  const selectCls = inputCls + ' appearance-none cursor-pointer';
-
-  return (
-    <motion.div
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1 }}
-      exit={{ opacity: 0 }}
-      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm"
-      onClick={onClose}
-    >
-      <motion.div
-        initial={{ opacity: 0, scale: 0.96, y: 10 }}
-        animate={{ opacity: 1, scale: 1, y: 0 }}
-        exit={{ opacity: 0, scale: 0.96, y: 10 }}
-        transition={{ type: 'spring', stiffness: 300, damping: 26 }}
-        className="w-full max-w-md rounded-2xl bg-[#0d1321] border border-[#1E2D4A] shadow-[0_25px_50px_rgba(0,0,0,0.7)] overflow-hidden"
-        onClick={(e) => e.stopPropagation()}
-      >
-        {/* Header */}
-        <div className="flex items-center justify-between px-5 py-4 border-b border-[#1E2D4A]">
-          <div className="flex items-center gap-2.5">
-            <div className="w-8 h-8 rounded-lg bg-violet-500/15 border border-violet-500/30 flex items-center justify-center">
-              <Settings2 className="w-4 h-4 text-violet-400" />
-            </div>
-            <div>
-              <div className="text-sm font-bold text-white">Edit Order Specs</div>
-              <div className="text-[11px] text-slate-500">{order.tokenNumber} · {order.name}</div>
-            </div>
-          </div>
-          <button
-            onClick={onClose}
-            className="p-1.5 rounded-lg hover:bg-slate-800 text-slate-400 hover:text-white transition-colors"
-          >
-            <X className="w-4 h-4" />
-          </button>
-        </div>
-
-        {/* Customer note (read-only) */}
-        {order.notes && (
-          <div className="mx-5 mt-4 px-3.5 py-2.5 rounded-xl bg-amber-500/10 border border-amber-500/20 flex items-start gap-2">
-            <span className="text-amber-400 text-sm mt-0.5">📝</span>
-            <p className="text-xs text-amber-200 leading-relaxed">{order.notes}</p>
-          </div>
-        )}
-
-        {/* Fields */}
-        <div className="px-5 py-4 space-y-4">
-          <div className="grid grid-cols-2 gap-3">
-            {/* Paper Size */}
-            <div>
-              <label className="block text-[11px] font-semibold text-slate-400 uppercase tracking-wide mb-1.5">
-                Paper Size
-              </label>
-              <select value={paperSize} onChange={(e) => setPaperSize(e.target.value)} className={selectCls}>
-                {PAPER_SIZES.map((s) => <option key={s} value={s}>{s}</option>)}
-              </select>
-            </div>
-            {/* Color Mode */}
-            <div>
-              <label className="block text-[11px] font-semibold text-slate-400 uppercase tracking-wide mb-1.5">
-                Color Mode
-              </label>
-              <select value={colorMode} onChange={(e) => setColorMode(e.target.value)} className={selectCls}>
-                {COLOR_MODES.map((m) => <option key={m.value} value={m.value}>{m.label}</option>)}
-              </select>
-            </div>
-          </div>
-
-          {/* Sides */}
-          <div>
-            <label className="block text-[11px] font-semibold text-slate-400 uppercase tracking-wide mb-1.5">
-              Sides
-            </label>
-            <select value={sides} onChange={(e) => setSides(e.target.value)} className={selectCls}>
-              {SIDES_OPTIONS.map((s) => <option key={s.value} value={s.value}>{s.label}</option>)}
-            </select>
-          </div>
-
-          <div className="grid grid-cols-2 gap-3">
-            {/* Page Count */}
-            <div>
-              <label className="block text-[11px] font-semibold text-slate-400 uppercase tracking-wide mb-1.5">
-                Page Count
-              </label>
-              <input
-                type="number"
-                min="1"
-                value={pageCount}
-                onChange={(e) => setPageCount(e.target.value)}
-                className={inputCls}
-              />
-            </div>
-            {/* Copies */}
-            <div>
-              <label className="block text-[11px] font-semibold text-slate-400 uppercase tracking-wide mb-1.5">
-                Copies
-              </label>
-              <input
-                type="number"
-                min="1"
-                value={copies}
-                onChange={(e) => setCopies(e.target.value)}
-                className={inputCls}
-              />
-            </div>
-          </div>
-
-          {/* Total Price */}
-          <div>
-            <label className="block text-[11px] font-semibold text-slate-400 uppercase tracking-wide mb-1.5">
-              Total Price (₹) <span className="normal-case font-normal text-slate-600">— vendor override</span>
-            </label>
-            <div className="relative">
-              <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 text-sm font-bold pointer-events-none">₹</span>
-              <input
-                type="number"
-                min="0"
-                step="any"
-                value={totalPrice}
-                onChange={(e) => setTotalPrice(e.target.value)}
-                placeholder="Auto-calculated"
-                className={inputCls + ' pl-7'}
-              />
-            </div>
-          </div>
-
-          {error && (
-            <p className="flex items-center gap-1.5 text-xs text-red-400">
-              <AlertCircle className="w-3.5 h-3.5 flex-shrink-0" />
-              {error}
-            </p>
-          )}
-        </div>
-
-        {/* Footer */}
-        <div className="flex items-center justify-between px-5 py-3.5 border-t border-[#1E2D4A] bg-[#090e1a]">
-          <button
-            onClick={onClose}
-            className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-sm text-slate-200 font-medium transition-colors"
-          >
-            Cancel
-          </button>
-          <motion.button
-            whileHover={{ scale: 1.02 }}
-            whileTap={{ scale: 0.97 }}
-            onClick={handleSave}
-            disabled={saving}
-            className="flex items-center gap-2 px-5 py-2 rounded-xl bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-500 hover:to-indigo-500 text-white text-sm font-bold shadow-[0_0_15px_rgba(139,92,246,0.35)] disabled:opacity-50 disabled:cursor-not-allowed transition-all"
-          >
-            {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
-            {saving ? 'Saving…' : 'Save Changes'}
-          </motion.button>
-        </div>
-      </motion.div>
-    </motion.div>
-  );
 }

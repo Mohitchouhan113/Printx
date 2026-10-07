@@ -380,6 +380,7 @@ export default function ShopUploadPage({ params }) {
   const [step, setStep] = useState('form'); // 'form' | 'payment' | 'submitting' | 'upi_wait' | 'success'
   const [name, setName] = useState('');
   const [phone, setPhone] = useState('');
+  const [notes, setNotes] = useState('');
   const [filesList, setFilesList] = useState([]); // Array<{ id, file, pageCount, config, name, size, type }>
   const [fileError, setFileError] = useState(null);
   const [dragOver, setDragOver] = useState(false);
@@ -994,6 +995,9 @@ export default function ShopUploadPage({ params }) {
       // Selective page range — 'all' or e.g. "1-5, 8, 11-15" (orders.page_range)
       fd.append('pageRange', pageRangeValue);
 
+      // Special instructions from the customer (orders.notes)
+      fd.append('notes', notes.trim());
+
       // Smart AI color split — explicit totals → orders.bw_pages / color_pages
       fd.append('bwPages', String(rawPages.totalBwPages));
       fd.append('colorPages', String(rawPages.totalColorPages));
@@ -1190,6 +1194,7 @@ export default function ShopUploadPage({ params }) {
     setStep('form');
     setName('');
     setPhone('');
+    setNotes('');
     setFilesList([]);
     setFileError(null);
     setToken(null);
@@ -2105,6 +2110,20 @@ export default function ShopUploadPage({ params }) {
               {phone && !phoneValid && (
                 <span className="text-[11px] text-red-400 mt-1 block">Enter a valid 10-digit mobile number</span>
               )}
+            </label>
+
+            <label className="block mt-3">
+              <span className="text-xs font-semibold text-slate-400">
+                Special Instructions
+                <span className="ml-1.5 font-normal text-slate-600">(optional)</span>
+              </span>
+              <textarea
+                rows={2}
+                value={notes}
+                onChange={(e) => setNotes(e.target.value)}
+                placeholder="e.g., Front page colorful, rest B&W, or double-sided print"
+                className="mt-1.5 w-full rounded-xl bg-[#0B132B] border border-[#1E2D4A] px-3.5 py-3 text-sm text-white placeholder-slate-600 focus:outline-none focus:ring-2 focus:border-cyan-500/50 focus:ring-cyan-500/20 transition-colors resize-none"
+              />
             </label>
           </section>
 
