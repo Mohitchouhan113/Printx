@@ -52,6 +52,7 @@ export default function PaymentModal({
   // Form state
   const [fullName, setFullName] = useState('');
   const [whatsapp, setWhatsapp] = useState('');
+  const [notes, setNotes] = useState('');
   const [formError, setFormError] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const formErrorTimerRef = useRef(null);
@@ -121,6 +122,7 @@ export default function PaymentModal({
           binding: config?.binding || 'none',
           customer_phone: whatsapp,
           customer_name: fullName.trim(),
+          notes: notes.trim() || null,
           order_status: 'PENDING',
         }),
       });
@@ -282,6 +284,18 @@ export default function PaymentModal({
                     }}
                     placeholder="9876543210"
                     className="w-full rounded-xl border border-gray-300 dark:border-slate-600 bg-white dark:bg-slate-900 px-4 py-3 text-sm text-dark-navy dark:text-white placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-primary-500 transition-colors duration-300"
+                  />
+                </div>
+                <div className="col-span-2">
+                  <label className="text-sm font-medium text-dark-navy dark:text-white block mb-1 transition-colors duration-300">
+                    Special Instructions <span className="text-gray-400 dark:text-gray-500 font-normal">(optional)</span>
+                  </label>
+                  <textarea
+                    rows={2}
+                    value={notes}
+                    onChange={(e) => setNotes(e.target.value)}
+                    placeholder="e.g., Front page colorful, rest B&W, or double-sided print"
+                    className="w-full rounded-xl border border-gray-300 dark:border-slate-600 bg-white dark:bg-slate-900 px-4 py-3 text-sm text-dark-navy dark:text-white placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-primary-500 transition-colors duration-300 resize-none"
                   />
                 </div>
               </div>
