@@ -148,16 +148,19 @@ export async function POST(request) {
       return NextResponse.json({ success: false, error: 'Shop not found' }, { status: 404 });
     }
 
-    /* ---- Monthly order quota enforcement ----
+    /* ---- Monthly quota enforcement ----
+     * Orders (max_orders_monthly) AND pages (max_pages), both resolved from
+     * the shop's active subscriptions row via getShopActivePlan.
      * Fail-open: any error degrades to "allow" so a DB hiccup never blocks
      * a legitimate walk-in order at the counter. */
     try {
       const activePlan = await getShopActivePlan(shop.id);
+      const monthStart = new Date();
+      monthStart.setDate(1);
+      monthStart.setHours(0, 0, 0, 0);
+
       const maxOrders = activePlan.max_orders_monthly ?? -1;
       if (maxOrders !== -1) {
-        const monthStart = new Date();
-        monthStart.setDate(1);
-        monthStart.setHours(0, 0, 0, 0);
         const { count, error: countErr } = await supabaseAdmin
           .from('print_jobs')
           .select('*', { count: 'exact', head: true })
@@ -172,6 +175,39 @@ export async function POST(request) {
             },
             { status: 403 }
           );
+        }
+      }
+
+      /* ---- Page quota (max_pages) ----
+       * Caps this month's total sheets: pages already printed + the sheets
+       * this counter sale would add ((bw + color) × copies). -1/null =
+       * unlimited. Usage query fail-open: a schema without `pages` logs a
+       * warning and lets the walk-in order through. */
+      const maxPages = activePlan.max_pages;
+      if (Number.isFinite(maxPages) && maxPages >= 0) {
+        const incomingPages = (bwPages + colorPages) * copies;
+        const { data: pageRows, error: pageErr } = await supabaseAdmin
+          .from('print_jobs')
+          .select('pages')
+          .eq('shop_id', shop.id)
+          .gte('created_at', monthStart.toISOString())
+          .limit(5000);
+        if (pageErr) {
+          console.warn('[manual-entry] page-quota usage query failed — allowing order:', pageErr.message);
+        } else {
+          const usedPages = (pageRows || []).reduce((sum, r) => sum + (Number(r.pages) || 0), 0);
+          if (usedPages + incomingPages > maxPages) {
+            return NextResponse.json(
+              {
+                success: false,
+                error: `Monthly page limit reached (${maxPages} pages/month). Please upgrade your plan.`,
+                planLimitReached: true,
+                maxPages,
+                usedPages,
+              },
+              { status: 403 }
+            );
+          }
         }
       }
     } catch (quotaErr) {

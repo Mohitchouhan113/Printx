@@ -27,6 +27,7 @@ import { AuthProvider, useUserRole, ROLES } from '../../lib/auth';
 import { supabase, isSupabaseConfigured } from '../../lib/supabaseClient';
 import { resolveSubscriptionState } from '../../lib/subscription';
 import { PLANS } from '../../lib/plans';
+import { fetchActiveSubscription } from '../../lib/activeSubscription';
 
 const DASHBOARD_PATH = '/vendor/dashboard';
 
@@ -95,17 +96,30 @@ function VendorShellInner({ children, basePath, shopName, initial }) {
   const displayName = shop?.name || (shopStatus === 'not-found' ? 'No shop linked' : shopName);
   const displayInitial = shop?.name ? shopInitials(shop.name) : initial;
 
-  /* ---- Plan feature flags from static catalog (sync, no DB round-trip) ----
-   * Used to lock/unlock sidebar nav items. The static PLANS catalog (extended
-   * in lib/plans.js with quota fields) is the source — avoids a DB query on
-   * every navigation render. The analytics page itself does its own dynamic
-   * check; the sidebar just adds a discoverable lock icon. */
+  /* ---- Plan feature flags — static catalog base, enriched once per shop
+   * (not per render) by the shop's ACTIVE subscriptions row: the
+   * entitlement snapshot written at payment/assignment time overrides the
+   * static defaults, and custom plan codes absent from the static catalog
+   * still resolve from their subscription record. The analytics page does
+   * its own dynamic check; the sidebar just adds a discoverable lock icon.
+   * Fail-open: while the snapshot resolves (or if RLS/table drift denies
+   * it) flags fall back to the static catalog. */
   const activePlanId = shop?.subscription_plan || 'free';
   const staticPlan = PLANS[activePlanId] || PLANS.free;
+  const [subEntitlement, setSubEntitlement] = useState(null);
+  useEffect(() => {
+    setSubEntitlement(null); // avoid stale flags from the previous plan
+    let cancelled = false;
+    (async () => {
+      const sub = await fetchActiveSubscription(shop?.id || null, activePlanId);
+      if (!cancelled) setSubEntitlement(sub);
+    })();
+    return () => { cancelled = true; };
+  }, [shop?.id, activePlanId]);
   const planFeatureFlags = {
-    has_analytics: staticPlan.has_analytics ?? true,
-    has_whatsapp_bot: staticPlan.has_whatsapp_bot ?? true,
-    has_custom_poster: staticPlan.has_custom_poster ?? true,
+    has_analytics: subEntitlement?.has_analytics ?? staticPlan.has_analytics ?? true,
+    has_whatsapp_bot: subEntitlement?.has_whatsapp_bot ?? staticPlan.has_whatsapp_bot ?? true,
+    has_custom_poster: subEntitlement?.has_custom_poster ?? staticPlan.has_custom_poster ?? true,
   };
 
   /* Paper ream stock — numeric-safe (bigint columns can arrive as strings). */

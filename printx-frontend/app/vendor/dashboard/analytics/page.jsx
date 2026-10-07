@@ -24,6 +24,7 @@ import { supabase, isSupabaseConfigured } from '../../../../lib/supabaseClient';
 import { selectStrict } from '../../../../lib/supabaseSelect';
 import { fetchPlans, planIsActive } from '../../../../lib/plansStore';
 import { PLANS } from '../../../../lib/plans';
+import { fetchActiveSubscription } from '../../../../lib/activeSubscription';
 
 /**
  * Shop Analytics & Revenue Dashboard — REAL DATA ONLY.
@@ -51,26 +52,45 @@ export default function AnalyticsPage() {
   // Feature gating: has_analytics from the active plan (fail-open = true)
   const [hasAnalytics, setHasAnalytics] = useState(true);
 
-  /* ---- Determine has_analytics from the shop's active plan ---- */
+  /* ---- Determine has_analytics from the shop's active plan ----
+   * Precedence: the shop's ACTIVE `subscriptions` row (entitlement snapshot
+   * written at payment/assignment) → dynamic plans catalog → static
+   * lib/plans.js. A missing/NULL subscription row resolves through the
+   * catalog for the effective plan — a shop on 'free' (no paid subscription)
+   * therefore lands on has_analytics = false (locked), while infrastructure
+   * failures still fail-open (true). Server-side, /api/jobs/queue-status
+   * re-checks the same flag via getShopActivePlan. */
   useEffect(() => {
-    if (!shop?.subscription_plan) return;
+    if (!shop?.id) return;
+    const planCode = shop?.subscription_plan || 'free';
     (async () => {
+      // 1) Active subscription row — purchase-record flag.
+      try {
+        const sub = await fetchActiveSubscription(shop.id, planCode);
+        if (sub && sub.has_analytics != null) {
+          setHasAnalytics(Boolean(sub.has_analytics));
+          return;
+        }
+      } catch { /* fall through to plans catalog */ }
+
+      // 2) Dynamic plans catalog
       try {
         const { data, error } = await fetchPlans();
         if (!error && data && data.length > 0) {
           const active = data.filter(planIsActive);
-          const planRow = active.find((p) => p.code === (shop.subscription_plan || 'free'));
+          const planRow = active.find((p) => p.code === planCode);
           if (planRow && planRow.has_analytics !== undefined && planRow.has_analytics !== null) {
             setHasAnalytics(Boolean(planRow.has_analytics));
             return;
           }
         }
       } catch { /* fall through to static fallback */ }
-      // Static fallback — fail-open (true) if column absent
-      const staticPlan = PLANS[shop.subscription_plan || 'free'] || PLANS.free;
+
+      // 3) Static fallback — fail-open (true) if column absent
+      const staticPlan = PLANS[planCode] || PLANS.free;
       setHasAnalytics(staticPlan.has_analytics ?? true);
     })();
-  }, [shop?.subscription_plan]);
+  }, [shop?.subscription_plan, shop?.id]);
 
   /* ---------- Fetch real print_jobs for THIS shop in the selected range ---------- */
   const fetchJobs = useCallback(async () => {

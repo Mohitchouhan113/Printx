@@ -1,5 +1,5 @@
 import { supabaseAdmin, isSupabaseAdminConfigured } from './supabaseAdmin';
-import { getPlanLabel } from './plans';
+import { getPlanLabel, PLANS } from './plans';
 
 /**
  * Subscription activation service — shared by /api/razorpay/verify and
@@ -8,7 +8,9 @@ import { getPlanLabel } from './plans';
  *
  *  1. shops.subscription_plan        = planId
  *  2. shops.subscription_expires_at  = NOW + 1mo/1yr (NULL for lifetime)
- *  3. subscriptions row insert       (invoice tracking)
+ *  3. subscriptions row insert       (invoice tracking + feature-limit
+ *     snapshot: max_printers, max_pages, max_orders_monthly, has_whatsapp_bot,
+ *     has_analytics, has_custom_poster — read back by getShopActivePlan)
  *
  * Demo mode (no Supabase): returns the computed expiry without persisting.
  */
@@ -53,6 +55,92 @@ const SHOPS_MISSING_COLUMNS = new Set();
 function ledgerDescription({ planId, billingCycle, shopId, paymentId }) {
   const label = getPlanLabel(planId, billingCycle);
   return `${label} subscription · shop ${shopId} · payment ${paymentId || 'unknown'}`;
+}
+
+/**
+ * Feature-limit snapshot written INTO the subscriptions row when a plan is
+ * purchased or assigned. Source chain: `plans` table (live admin config) →
+ * static lib/plans.js catalog → fail-open -1 quotas. Lifetime entitlements
+ * are forced to the documented values: 9999 printers / 999999 pages / every
+ * feature flag true (finite but effectively unlimited — every quota check
+ * gets a concrete number to compare instead of a magic sentinel).
+ *
+ * @param {string} planId       - basic | pro | advance | lifetime | free
+ * @param {string} billingCycle - monthly | yearly | lifetime
+ * @returns {Promise<object>}   - the limit columns for the subscriptions row
+ */
+export async function resolvePlanLimits(planId, billingCycle = 'monthly') {
+  const isLifetime = planId === 'lifetime' || billingCycle === 'lifetime';
+  const staticPlan = PLANS[planId] || PLANS.free;
+
+  let planRow = null;
+  if (isSupabaseAdminConfigured && supabaseAdmin) {
+    try {
+      const { data, error } = await supabaseAdmin
+        .from('plans')
+        .select('max_printers, max_pages, max_orders_monthly, has_whatsapp_bot, has_analytics, has_custom_poster')
+        .eq('code', planId)
+        .maybeSingle();
+      if (error) {
+        console.warn(`[subscription] plans limit fetch for "${planId}" failed — static catalog used:`, error.message);
+      } else {
+        planRow = data || null;
+      }
+    } catch (err) {
+      console.warn('[subscription] plans limit fetch threw — static catalog used:', err?.message || err);
+    }
+  }
+
+  const limits = {
+    max_printers: planRow?.max_printers ?? staticPlan.max_printers ?? -1,
+    max_pages: planRow?.max_pages ?? staticPlan.max_pages ?? -1,
+    max_orders_monthly: planRow?.max_orders_monthly ?? staticPlan.max_orders_monthly ?? -1,
+    has_whatsapp_bot: planRow?.has_whatsapp_bot ?? staticPlan.has_whatsapp_bot ?? false,
+    has_analytics: planRow?.has_analytics ?? staticPlan.has_analytics ?? false,
+    has_custom_poster: planRow?.has_custom_poster ?? staticPlan.has_custom_poster ?? false,
+  };
+
+  if (isLifetime) {
+    limits.max_printers = 9999;
+    limits.max_pages = 999999;
+    limits.has_whatsapp_bot = true;
+    limits.has_analytics = true;
+    limits.has_custom_poster = true;
+  }
+  return limits;
+}
+
+/**
+ * Insert one subscriptions row with progressive column-drop — any column
+ * this deployment's schema lacks is remembered (SUBSCRIPTIONS_MISSING_COLUMNS)
+ * and dropped, so a schema difference never blocks a paid activation.
+ * Shared with the admin plan-assignment route (/api/admin/shops) so payment
+ * verification and admin assignment write identical entitlement shapes.
+ *
+ * @returns {Promise<{ ok: boolean, error: any }>}
+ */
+export async function writeSubscriptionRow(payload) {
+  let subRow = { ...payload };
+  for (const col of SUBSCRIPTIONS_MISSING_COLUMNS) delete subRow[col];
+
+  let lastErr = null;
+  // 17 payload keys max (base 11 + 6 limit columns); one drop per round trip.
+  for (let i = 0; i < 14 && Object.keys(subRow).length > 0; i++) {
+    const { error: err } = await supabaseAdmin.from('subscriptions').insert(subRow);
+    if (!err) return { ok: true, error: null };
+    lastErr = err;
+    const missing =
+      (err.message || '').match(/'([\w]+)'\s+column|column\s+"(\w+)"/)?.[1] ||
+      (err.message || '').match(/'([\w]+)'\s+column|column\s+"(\w+)"/)?.[2];
+    if ((err.code === 'PGRST204' || err.code === '42703') && missing && missing in subRow) {
+      console.warn(`[subscription] subscriptions missing column "${missing}" — dropping it`);
+      SUBSCRIPTIONS_MISSING_COLUMNS.add(missing);
+      delete subRow[missing];
+      continue;
+    }
+    break;
+  }
+  return { ok: false, error: lastErr };
 }
 
 /**
@@ -184,10 +272,16 @@ export async function applySubscriptionUpgrade({
     return { ok: false, expiresAt, error: shopErr.message };
   }
 
-  // ---- 2. Invoice/subscription record (with progressive-column-drop for start_date/end_date) ----
+  // ---- 2. Invoice/subscription record ----
+  // Includes the plan's feature-limit snapshot so every quota/feature check
+  // can read entitlements straight off this row (getShopActivePlan). The
+  // write itself is progressive-column-drop (writeSubscriptionRow) so a
+  // schema without the limit columns still records the purchase.
+  const planLimits = await resolvePlanLimits(planId, billingCycle);
   const subPayload = {
     shop_id: shopId,
     plan_id: planId,
+    ...planLimits,
     billing_cycle: planId === 'lifetime' ? 'lifetime' : billingCycle,
     amount_rupees: amountRupees,
     payment_id: paymentId,
@@ -197,27 +291,9 @@ export async function applySubscriptionUpgrade({
     start_date: baseDate,
     end_date: expiresAt,
   };
-  let subRow = { ...subPayload };
-  for (const col of SUBSCRIPTIONS_MISSING_COLUMNS) delete subRow[col];
+  const { ok: subOk, error: subErr } = await writeSubscriptionRow(subPayload);
 
-  let subErr = null;
-  for (let i = 0; i < 4; i++) {
-    const { error: err } = await supabaseAdmin.from('subscriptions').insert(subRow);
-    if (!err) { subErr = null; break; }
-    subErr = err;
-    const missing =
-      (err.message || '').match(/'([\w]+)'\s+column|column\s+"(\w+)"/)?.[1] ||
-      (err.message || '').match(/'([\w]+)'\s+column|column\s+"(\w+)"/)?.[2];
-    if ((err.code === 'PGRST204' || err.code === '42703') && missing && missing in subRow) {
-      console.warn(`[subscription] subscriptions missing column "${missing}" — dropping it`);
-      SUBSCRIPTIONS_MISSING_COLUMNS.add(missing);
-      delete subRow[missing];
-      continue;
-    }
-    break;
-  }
-
-  if (subErr) {
+  if (!subOk) {
     // Shop plan already updated; log but don't fail the activation.
     console.error('[subscription] subscriptions insert failed:', subErr);
   }

@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { supabaseAdmin, isSupabaseAdminConfigured } from '../../../../lib/supabaseAdmin';
 import { PLANS } from '../../../../lib/plans';
+import { resolvePlanLimits, writeSubscriptionRow } from '../../../../lib/subscriptionService';
 import {
   deriveShopStatus,
   isSubscriptionExpired,
@@ -206,6 +207,39 @@ export async function PATCH(request) {
       },
       { status: migrationRequired ? 501 : 500 }
     );
+  }
+
+  /* ---------- Entitlement snapshot: record an assigned plan in
+   * `subscriptions` WITH its feature limits (max_printers, max_pages,
+   * max_orders_monthly, has_whatsapp_bot, has_analytics, has_custom_poster)
+   * so feature checks read the same shape as a paid purchase. Best-effort —
+   * the shops update above already succeeded, so a schema without the
+   * subscriptions table must not turn a successful assignment into an error.
+   * 'free' writes no row: the free tier is the ABSENCE of an entitlement. */
+  if (plan !== undefined && plan !== 'free') {
+    try {
+      const limits = await resolvePlanLimits(plan, plan === 'lifetime' ? 'lifetime' : 'monthly');
+      const { ok: subOk, error: subErr } = await writeSubscriptionRow({
+        shop_id: shopId,
+        plan_id: plan,
+        ...limits,
+        billing_cycle: plan === 'lifetime' ? 'lifetime' : 'monthly',
+        amount_rupees: 0, // admin grant — no money moved
+        payment_id: null,
+        order_id: null,
+        invoice_number: `ADM-${Date.now()}`,
+        status: 'paid',
+        start_date: new Date().toISOString(),
+        // Inherit the shop's expiry clock (null ⇒ indefinite — matches the
+        // documented shops.subscription_expires_at backdoor).
+        end_date: saved?.subscription_expires_at || null,
+      });
+      if (!subOk) {
+        console.warn('[admin/shops] subscription entitlement row not recorded:', subErr?.message || subErr);
+      }
+    } catch (entErr) {
+      console.warn('[admin/shops] subscription entitlement write failed:', entErr?.message || entErr);
+    }
   }
 
   return NextResponse.json({

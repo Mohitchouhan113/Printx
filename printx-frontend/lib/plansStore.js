@@ -49,7 +49,7 @@ export async function fetchPlans() {
   // still return rows — app code treats missing columns as null (fail-open).
   const { data, error } = await selectStrict(
     (cols) => supabase.from('plans').select(cols).order('created_at', { ascending: true }),
-    'id, code, name, original_price, offer_price, billing_cycle, badge_tag, features, is_active, max_printers, max_orders_monthly, has_whatsapp_bot, has_analytics, has_custom_poster, created_at',
+    'id, code, name, original_price, offer_price, billing_cycle, badge_tag, features, is_active, max_printers, max_pages, max_orders_monthly, has_whatsapp_bot, has_analytics, has_custom_poster, created_at',
     'code, name, original_price, offer_price, billing_cycle, badge_tag, features, created_at',
     'plans:all'
   );

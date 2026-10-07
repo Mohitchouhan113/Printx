@@ -29,6 +29,8 @@ import { useShop } from '../../../../components/ShopContext';
 import { supabase, isSupabaseConfigured } from '../../../../lib/supabaseClient';
 import { fetchPlans, planIsActive } from '../../../../lib/plansStore';
 import { PLANS } from '../../../../lib/plans';
+import { fetchActiveSubscription } from '../../../../lib/activeSubscription';
+import { normalizeQuota } from '../../../../lib/subscriptionLimits';
 
 /* ========================================================================
  * STATUS STYLES
@@ -141,29 +143,48 @@ export default function PrintersPage() {
     fetchPrinters();
   }, [fetchPrinters]);
 
-  /* ---- Fetch active plan limits for printer quota ---- */
+  /* ---- Fetch active plan limits for printer quota ----
+   * Precedence: the shop's ACTIVE `subscriptions` row (entitlement snapshot
+   * written at payment/assignment: max_printers etc.) → dynamic plans
+   * catalog → static lib/plans.js. No hardcoded limit anywhere — a NULL or
+   * missing subscription row falls through to the 'free' tier catalog row
+   * (1 printer), while the server-side /api/printers/add check remains
+   * authoritative regardless of what this fast-path resolves to. */
   useEffect(() => {
-    if (!shop?.subscription_plan) return;
+    if (!shopId) return; // demo / pre-hydration — leave unlimited fast-path
+    const planCode = shop?.subscription_plan || 'free';
     (async () => {
+      // 1) Active subscription row — the purchase-record limit.
+      try {
+        const sub = await fetchActiveSubscription(shopId, planCode);
+        if (sub && sub.max_printers != null) {
+          setMaxPrinters(normalizeQuota(sub.max_printers, -1));
+          setActivePlanName(PLANS[planCode]?.name || planCode || 'Free');
+          return;
+        }
+      } catch { /* fall through to plans catalog */ }
+
+      // 2) Dynamic plans catalog
       try {
         const { data, error } = await fetchPlans();
         if (!error && data && data.length > 0) {
           const active = data.filter(planIsActive);
-          const planRow = active.find((p) => p.code === (shop.subscription_plan || 'free'));
+          const planRow = active.find((p) => p.code === planCode);
           if (planRow) {
             const limit = planRow.max_printers ?? -1;
             setMaxPrinters(limit);
-            setActivePlanName(planRow.name || shop.subscription_plan || 'Free');
+            setActivePlanName(planRow.name || planCode || 'Free');
             return;
           }
         }
       } catch { /* fall through to static fallback */ }
-      // Static fallback from lib/plans.js
-      const staticPlan = PLANS[shop.subscription_plan || 'free'] || PLANS.free;
+
+      // 3) Static fallback from lib/plans.js
+      const staticPlan = PLANS[planCode] || PLANS.free;
       setMaxPrinters(staticPlan.max_printers ?? -1);
       setActivePlanName(staticPlan.name || 'Free');
     })();
-  }, [shop?.subscription_plan]);
+  }, [shop?.subscription_plan, shopId]);
 
   /* -------------------- Add / Edit -------------------- */
   const openAdd = () => {

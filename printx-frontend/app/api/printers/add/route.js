@@ -67,14 +67,19 @@ export async function POST(request) {
     );
   }
 
-  /* ---- Printer quota enforcement ---- */
-  // Fail-open: any error in the quota check degrades to "allow" so an
-  // infrastructure issue never silently blocks a legitimate printer add.
+  /* ---- Printer quota enforcement ----
+   * max_printers is resolved from the shop's ACTIVE subscriptions row (the
+   * entitlement snapshot written at payment/assignment time), falling back
+   * to the plans catalog — see lib/getShopActivePlan. No hardcoded limit:
+   * block ONLY when the live printer count has reached the numeric cap.
+   * Fail-open: any error in the quota check degrades to "allow" so an
+   * infrastructure issue never silently blocks a legitimate printer add. */
   try {
     const activePlan = await getShopActivePlan(shopId);
-    const maxPrinters = activePlan.max_printers ?? -1;
+    const maxPrinters = activePlan.max_printers;
 
-    if (maxPrinters !== -1) {
+    // null / non-finite / negative (−1) ⇒ unlimited, nothing to enforce.
+    if (Number.isFinite(maxPrinters) && maxPrinters >= 0) {
       const { count, error: countErr } = await supabaseAdmin
         .from('printers')
         .select('*', { count: 'exact', head: true })

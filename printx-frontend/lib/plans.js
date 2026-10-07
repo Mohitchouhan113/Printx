@@ -14,8 +14,11 @@ const PLANS = {
     yearly: 0,
     lifetime: null,
     features: ['1 Printer Connection', 'Max 50 Orders/month', 'Manual Token Queue', 'Community Support'],
-    // Quota / feature-gate fields — static fallback when plans table is unavailable
+    // Quota / feature-gate fields — static fallback when plans table is unavailable.
+    // Integer quotas: -1 = unlimited. max_pages caps total sheets printed per
+    // calendar month (enforced in /api/upload and /api/jobs/manual-entry).
     max_printers: 1,
+    max_pages: 500,
     max_orders_monthly: 50,
     has_analytics: false,
     has_whatsapp_bot: false,
@@ -29,6 +32,7 @@ const PLANS = {
     lifetime: null,
     features: ['2 Printer Fleet Connections', 'Max 500 Live Orders/month', 'Basic Daily Revenue Analytics', 'Email Support'],
     max_printers: 2,
+    max_pages: 5000,
     max_orders_monthly: 500,
     has_analytics: true,
     has_whatsapp_bot: false,
@@ -49,6 +53,7 @@ const PLANS = {
       'Custom Branding on Receipts',
     ],
     max_printers: 4,
+    max_pages: 50000,
     max_orders_monthly: -1,
     has_analytics: true,
     has_whatsapp_bot: true,
@@ -68,6 +73,7 @@ const PLANS = {
       '24/7 Phone Support',
     ],
     max_printers: -1,
+    max_pages: -1,
     max_orders_monthly: -1,
     has_analytics: true,
     has_whatsapp_bot: true,
@@ -87,7 +93,11 @@ const PLANS = {
       'All future features included',
       'Zero renewals — ever',
     ],
-    max_printers: -1,
+    // Lifetime caps mirror the values written to the subscriptions row on
+    // purchase: 9999 printers / 999999 pages — effectively unlimited while
+    // staying finite so every quota check has a concrete number to compare.
+    max_printers: 9999,
+    max_pages: 999999,
     max_orders_monthly: -1,
     has_analytics: true,
     has_whatsapp_bot: true,
