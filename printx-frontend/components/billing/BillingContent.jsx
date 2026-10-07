@@ -48,22 +48,27 @@ const formatDate = (dateStr) => {
   }
 };
 
-/**
- * BillingContent — Billing & Subscription, REAL DATA ONLY.
- *
- * - Current plan + expiry read from the owner-scoped `shops` row
- *   (subscription_plan / subscription_expires_at) via the shared ShopContext.
- * - Invoice history loaded from the `subscriptions` table (real Razorpay
- *   payments). Empty → clean "No billing history available" state.
- * - Usage meters computed from the shop's actual print_jobs.
- * - Upgrade buttons run the real Razorpay checkout flow; on success the
- *   context shop is refreshed so every tab reflects the new plan.
- *
- * CRASH SAFETY: every read is wrapped and every plan/offer access is guarded
- * with `?.` + static `PLANS` fallbacks. A missing table, a missing column or
- * an undefined plan row can never throw a client-side exception — the page
- * degrades to honest empty/zero states or shows the hardcoded catalog instead.
- */
+
+// 3. ReceiptRow Component.
+const ReceiptRow = ({ item, title, date, amount, status }) => {
+  const displayTitle = title || item?.plan_name || item?.description || 'Plan Subscription';
+  const displayDate = date || (item?.created_at ? formatDate(item.created_at) : 'N/A');
+  const displayAmount = amount ?? item?.amount_rupees ?? item?.amount ?? 0;
+  const displayStatus = status || item?.status || 'paid';
+
+  return (
+    <div className="flex justify-between items-center py-3 border-b border-gray-800 text-sm">
+      <div>
+        <p className="font-medium text-white">{displayTitle}</p>
+        <p className="text-xs text-gray-400">{displayDate}</p>
+      </div>
+      <div className="text-right">
+        <p className="font-semibold text-green-400">₹{displayAmount}</p>
+        <span className="text-xs text-gray-400 capitalize">{displayStatus}</span>
+      </div>
+    </div>
+  );
+};
 
 /* UI presentation metadata keyed by the shared catalog in lib/plans.js */
 const PLAN_UI = {
