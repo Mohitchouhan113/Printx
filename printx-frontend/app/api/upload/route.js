@@ -117,6 +117,12 @@ export async function POST(request) {
     const bwPagesTotal = parseInt(formData.get('bwPages') ?? '', 10);
     const colorPagesTotal = parseInt(formData.get('colorPages') ?? '', 10);
 
+    // Special instructions / notes from the customer — stored in both
+    // print_jobs and orders so every read path finds them.
+    const userNote = String(formData.get('notes') || '').trim() || null;
+
+    console.log('📦 CREATING ORDER WITH NOTES:', userNote);
+
     // Payment selection from the mandatory Step 2
     const paymentStatus = String(formData.get('paymentStatus') || 'UNPAID').trim().toUpperCase();
     const paymentMode = String(formData.get('paymentMode') || 'CASH').trim().toUpperCase();
@@ -582,6 +588,9 @@ export async function POST(request) {
         bindingCost,
         paperSize,
         pageRange,
+        // Notes inside config JSONB as an extra fallback if the top-level
+        // notes / special_instructions columns are absent or dropped.
+        ...(userNote ? { notes: userNote } : {}),
       },
       files_metadata: filesMetadataPayload,
       // Pricing snapshot (null-safe for legacy rows / older clients).
@@ -611,6 +620,14 @@ export async function POST(request) {
       // listener still sees the row, but its status keeps it out of the
       // announced/active states until payment lands.
       status: 'unpaid',
+      // Customer special instructions — stored on both tables so every
+      // read path (realtime print_jobs, sidecar orders query) surfaces them.
+      // Also written into `metadata` JSONB as a schema-drift-proof fallback:
+      // JSONB columns survive MISSING_COLUMNS drops, so notes is always
+      // recoverable even if the top-level column hasn't been migrated yet.
+      notes: userNote,
+      special_instructions: userNote,
+      ...(userNote ? { metadata: { notes: userNote } } : {}),
     };
 
     // Insert with progressive schema fallback: on schema drift (missing
@@ -744,6 +761,9 @@ export async function POST(request) {
       // the vendor queue only ever sees one of them advance).
       status: 'unpaid',
       ...(dailyTokenNo != null ? { token_no: dailyTokenNo } : {}),
+      // Customer special instructions — mirrored from print_jobs so both
+      // the realtime listener and the sidecar orders query surface them.
+      ...(userNote ? { notes: userNote, special_instructions: userNote, metadata: { notes: userNote } } : {}),
     };
     // Same adaptive strategy as print_jobs, with its own cache so the orders
     // sidecar also converges to ONE insert per order instead of re-probing

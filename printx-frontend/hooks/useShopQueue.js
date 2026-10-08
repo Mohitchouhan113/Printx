@@ -24,11 +24,11 @@ import { selectStrict } from '../lib/supabaseSelect';
 // none of which exist — so PostgREST answered 400 and selectStrict silently
 // dropped to QUEUE_SAFE_COLS for every poll.
 const QUEUE_PREF_COLS =
-  'id, shop_id, token_number, customer_name, customer_phone, file_name, file_url, pages, copies, color_option, config, binding_type, binding_cost, files_metadata, status, created_at';
-// SAFE list is the permanent fallback: it must still carry `config` and
-// `files_metadata`, because those are the ONLY places the preview URL lives
-// (print_jobs.file_url is nulled by privacy purges while files_metadata may
-// still hold the tab data the preview modal renders).
+  'id, shop_id, token_number, customer_name, customer_phone, file_name, file_url, pages, copies, color_option, config, binding_type, binding_cost, files_metadata, status, created_at, notes, special_instructions';
+// SAFE list is the permanent fallback — must only contain columns confirmed
+// to exist in the live print_jobs schema. Do NOT add notes/special_instructions
+// here: if those columns don't exist, both lists would fail and selectStrict
+// would error the entire poll. notes is always recoverable via config.notes JSONB.
 const QUEUE_SAFE_COLS =
   'id, shop_id, token_number, customer_name, customer_phone, file_name, file_url, pages, copies, color_option, config, files_metadata, status, created_at';
 
