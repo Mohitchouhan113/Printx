@@ -1196,7 +1196,16 @@ export default function ShopUploadPage({ params }) {
       }
 
       if (res.error) {
-        console.error('Order insert error:', res.error);
+        // Full PostgREST error surface (code / message / details / hint) plus
+        // the keys we attempted to write — enough to diagnose schema drift,
+        // RLS rejection or a constraint straight from the browser console.
+        console.error('CRITICAL SUPABASE INSERT ERROR:', {
+          code: res.error.code,
+          message: res.error.message,
+          details: res.error.details,
+          hint: res.error.hint,
+          payloadKeys: Object.keys(insertPayload),
+        });
         throw new Error(res.error.message || 'Order creation failed');
       }
 
@@ -1293,6 +1302,12 @@ export default function ShopUploadPage({ params }) {
       // customer on the payment screen so they can retry without paying twice.
       setStep('payment');
       setOptimistic(null); // order did NOT land — roll the optimistic echo back
+      // Every failure path converges here — log the EXACT error (message,
+      // stack and any Supabase fields) so a silent order failure is always
+      // diagnosable from the browser console, and surface the exact message.
+      console.error('EXACT SUBMIT ORDER ERROR:', err);
+      try { err.printxLogged = true; } catch { /* frozen error object */ }
+      setSubmitError(err?.message || 'Order placement failed, please try again.');
       throw err;
     }
   };
@@ -1302,6 +1317,9 @@ export default function ShopUploadPage({ params }) {
     try {
       await submitOrder(chosenPayment);
     } catch (err) {
+      // Safety net for errors thrown before submitOrder's own try block
+      // (payment/file guards) or any future caller — log once, never silently.
+      if (!err?.printxLogged) console.error('EXACT SUBMIT ORDER ERROR:', err);
       setSubmitError(err?.message || 'Order placement failed, please try again.');
     }
   };
