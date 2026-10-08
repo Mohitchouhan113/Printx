@@ -885,8 +885,13 @@ export default function ShopUploadPage({ params }) {
     if (!chosenPayment?.payment_status || !chosenPayment?.payment_mode) {
       throw new Error('Payment method is required before placing the order');
     }
-    if (filesList.length === 0) {
-      throw new Error('No files to upload');
+    // Validate the active file array before touching payments or storage.
+    // Keep the failure message stable for the form error surface while also
+    // being explicit about what was checked, so the "At least one file is
+    // required" path never depends on a stale or mis-named state variable.
+    const activeFiles = Array.isArray(filesList) ? filesList : [];
+    if (!activeFiles.length) {
+      throw new Error('At least one file is required');
     }
 
     setStep('submitting');
@@ -951,30 +956,33 @@ export default function ShopUploadPage({ params }) {
 
       // Direct client-side upload to Supabase Storage so large orders no
       // longer funnel through a 300MB FormData round-trip over /api/upload.
-      const uploadedUrls = [];
-      for (let i = 0; i < filesList.length; i++) {
-        const item = filesList[i];
-        const file = item.file;
-        const filePath = `orders/${Date.now()}_${i}_${file.name.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
+      const uploadedUrls = await Promise.all(
+        activeFiles.map(async (f, i) => {
+          const file = f.file || f;
+          const filePath = `orders/${Date.now()}_${i}_${file.name.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
 
-        const { data: uploadData, error: uploadErr } = await supabase
-          .storage
-          .from('print-files')
-          .upload(filePath, file, { upsert: true });
+          const { data: uploadData, error: uploadErr } = await supabase
+            .storage
+            .from('print-files')
+            .upload(filePath, file, { upsert: true });
 
-        if (uploadErr) throw uploadErr;
+          if (uploadErr) throw uploadErr;
 
-        const { data: urlData } = supabase
-          .storage
-          .from('print-files')
-          .getPublicUrl(uploadData.path);
+          const { data: urlData } = supabase
+            .storage
+            .from('print-files')
+            .getPublicUrl(uploadData.path);
 
-        uploadedUrls.push({
-          url: urlData?.publicUrl,
-          path: uploadData.path,
-          name: item.name,
-        });
-      }
+          return {
+            name: f.name,
+            url: urlData?.publicUrl,
+            path: uploadData.path,
+            size: file.size,
+          };
+        })
+      );
+
+      uploadedFileUrls = uploadedUrls.map((u) => u.url);
 
       // Build the metadata payload the server uses to create the
       // print_jobs row and the per-file page/bw/color math.
@@ -1047,6 +1055,11 @@ export default function ShopUploadPage({ params }) {
         // per file, but the server-side order INSERT still needs to dedupe so
         // a stale retry never creates two paid tokens for the same request.
         idempotencyKey: `px-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
+
+        // File URLs persisted with the order so the server (and any future
+        // download/view flows) can resolve stored files even if the client
+        // navigates away before the order row is fully hydrated.
+        uploadedFileUrls,
       };
 
       // Resilient POST of the metadata order row — the files already landed
