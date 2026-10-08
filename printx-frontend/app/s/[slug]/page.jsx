@@ -1151,8 +1151,7 @@ export default function ShopUploadPage({ params }) {
         const attemptRes = await supabase
           .from('print_jobs')
           .insert(insertPayload)
-          .select('*')
-          .single();
+          .select('*');
 
         if (!attemptRes.error) { res = attemptRes; break; }
 
@@ -1195,31 +1194,36 @@ export default function ShopUploadPage({ params }) {
         delete insertPayload[missingCol];
       }
 
-      if (res.error) {
+      if (!res || res.error) {
         // Full PostgREST error surface (code / message / details / hint) plus
         // the keys we attempted to write — enough to diagnose schema drift,
         // RLS rejection or a constraint straight from the browser console.
+        const insertErr = res?.error || null;
         console.error('Supabase DB Insert Error:', {
-          code: res.error.code,
-          message: res.error.message,
-          details: res.error.details,
-          hint: res.error.hint,
+          code: insertErr?.code,
+          message: insertErr?.message,
+          details: insertErr?.details,
+          hint: insertErr?.hint,
           payloadKeys: Object.keys(insertPayload),
         });
-        throw new Error(`Database Insert Failed: ${res.error.message || 'no detail returned by PostgREST'}`);
+        throw new Error(`Database Insert Failed: ${insertErr?.message || 'no response after 15 insert attempts'}`);
       }
 
-      const data = res.data ? { success: true, tokenNumber: res.data.token_number, tokenNo: res.data.token_no, jobId: res.data.id } : { success: false };
-      const resOk = res.ok && data.success;
+      // .select() WITHOUT .single(): PostgREST can COMMIT the insert yet
+      // return no representation row (restricted RETURNING / RLS SELECT
+      // gap). No error means the row landed — never fail a saved order over
+      // a missing row. Fall back to the payload we sent; token_number is the
+      // one this client minted, so the customer still sees their real token.
+      const row = (Array.isArray(res.data) && res.data.length > 0) ? res.data[0] : null;
+      const createdOrder = row || { ...insertPayload, id: null };
+      console.log('Order Successfully Placed:', createdOrder);
 
-      if (!resOk) {
-        // STRICT MODE: the order was NOT persisted (DB insert failed, shop
-        // suspended, bucket rejected, …). Never continue to the success
-        // screen with a token that exists in no database row — tell the
-        // customer the placement failed so they can retry or pay at the
-        // counter instead of waiting forever for a print that never queued.
-        throw new Error(data.error || 'Order insert returned no row — nothing was saved. Check the console for "Supabase DB Insert Error".');
-      }
+      const data = {
+        success: true,
+        tokenNumber: row?.token_number ?? insertPayload.token_number ?? insertPayload.metadata?.token_number ?? null,
+        tokenNo: row?.token_no ?? null,
+        jobId: row?.id ?? null,
+      };
 
       // Cross-tab instant notification — the vendor dashboard in another tab
       // hears this even before Supabase Realtime (or when it isn't configured).
