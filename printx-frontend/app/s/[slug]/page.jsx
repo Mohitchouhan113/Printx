@@ -273,6 +273,39 @@ function whatsappShareUrl(text, phone) {
   return `https://wa.me/${clean}?text=${encodeURIComponent(text)}`;
 }
 
+/**
+ * mintTokenNumber — client-side mirror of the server's token minting
+ * (lib/dailyToken.js + legacy generateToken). Daily sequential pickup token
+ * (#1, #2, … resets each day per shop) read from the orders sidecar, with
+ * the legacy `#TK-XX` fallback when the lookup isn't possible.
+ * print_jobs.token_number is NOT NULL on the live schema and the old
+ * /api/upload route always supplied it — the direct browser insert must
+ * too, or Postgres rejects the row with a 23502 not-null violation.
+ */
+async function mintTokenNumber(supabaseClient, shopId) {
+  if (supabaseClient && shopId) {
+    try {
+      const dayStart = new Date();
+      dayStart.setHours(0, 0, 0, 0);
+      const { data, error } = await supabaseClient
+        .from('orders')
+        .select('token_no')
+        .eq('shop_id', shopId)
+        .gte('created_at', dayStart.toISOString())
+        .not('token_no', 'is', null)
+        .order('token_no', { ascending: false })
+        .limit(1);
+      if (!error) {
+        const last = Number(data?.[0]?.token_no);
+        return `#${Number.isFinite(last) ? last + 1 : 1}`;
+      }
+    } catch {
+      /* orders table/column unavailable — fall through to legacy token */
+    }
+  }
+  return `#TK-${Math.floor(Math.random() * 90) + 10}`;
+}
+
 /* ------------------------------------------------------------------ */
 /* Page                                                                */
 /* ------------------------------------------------------------------ */
@@ -955,73 +988,81 @@ export default function ShopUploadPage({ params }) {
         setWalletBalance(walletData.balance);
       }
 
-      // Direct client-side upload to Supabase Storage so large orders no
-      // longer funnel through a 300MB FormData round-trip over /api/upload.
+      // Direct Browser-to-Supabase Storage upload — supports 300MB+ files,
+      // no /api/upload round-trip.
       const activeFiles = currentFiles;
-      const uploadedFilesMetadata = [];
+      const uploadedFiles = [];
+
       for (const item of activeFiles) {
-        const fileObj = item.file || item.rawFile || item;
-        if (!fileObj || !(fileObj instanceof File || fileObj instanceof Blob)) continue;
+        const rawFile = item.file || item.rawFile || item;
+        if (!rawFile || !(rawFile instanceof File || rawFile instanceof Blob)) continue;
 
-        const cleanName = fileObj.name ? fileObj.name.replace(/[^a-zA-Z0-9.-]/g, '_') : 'file.pdf';
-        const filePath = `orders/${Date.now()}_${cleanName}`;
+        const cleanFileName = (rawFile.name || 'document.pdf').replace(/[^a-zA-Z0-9.-]/g, '_');
+        const filePath = `orders/${Date.now()}_${cleanFileName}`;
 
+        // Direct Client Upload (Supports 300MB+)
         const { data: uploadData, error: uploadErr } = await supabase
           .storage
           .from('print-files')
-          .upload(filePath, fileObj, { upsert: true });
+          .upload(filePath, rawFile, { upsert: true });
 
         if (uploadErr) {
-          console.error('Supabase Storage Error:', uploadErr);
-          throw new Error('Failed to upload ' + cleanName);
+          console.error('Storage Upload Failed:', uploadErr);
+          throw new Error('Upload failed for ' + cleanFileName);
         }
 
-        const { data: publicUrlData } = supabase
+        const { data: urlData } = supabase
           .storage
           .from('print-files')
           .getPublicUrl(filePath);
 
-        uploadedFilesMetadata.push({
-          file_obj: fileObj,
-          file_url: publicUrlData.publicUrl,
-          file_name: cleanName,
-          file_size: fileObj.size || 0,
+        uploadedFiles.push({
+          url: urlData.publicUrl,
+          name: cleanFileName,
+          size: rawFile.size || 0,
         });
       }
 
-      if (uploadedFilesMetadata.length === 0) {
-        throw new Error('Please select at least one file to upload');
+      if (uploadedFiles.length === 0) {
+        throw new Error('Please select at least one valid file.');
       }
 
-      const uploadedFileUrls = uploadedFilesMetadata.map((m) => m.file_url);
+      const uploadedFileUrls = uploadedFiles.map((f) => f.url);
 
-      // Build the metadata payload the server uses to create the
-      // print_jobs row and the per-file page/bw/color math.
-      const filesMetadata = uploadedFilesMetadata.map((meta, idx) => {
+      // Per-file page/bw/color math for the vendor console and the bill.
+      const filesMetadata = uploadedFiles.map((f, idx) => {
         const item = currentFiles[idx] || {};
-        const s = fileSplit(meta.fileObj || item, RATES, { printSpecific, pageRangeInput });
+        const s = fileSplit(item, RATES, { printSpecific, pageRangeInput });
         return {
           index: idx,
-          fileName: meta.file_name || item.name || `file_${idx + 1}`,
+          fileName: f.name,
           pageCount: s.effPages,
-          colorMode: meta.colorMode || item.config?.colorMode || 'B/W',
-          sides: meta.sides || item.config?.sides || 'single',
-          copies: meta.copies || item.config?.copies || 1,
+          colorMode: item.config?.colorMode || 'B/W',
+          sides: item.config?.sides || 'single',
+          copies: item.config?.copies || 1,
           bwPages: s.bwPages,
           colorPages: s.colorPages,
-          storedPath: meta.file_url,
-          storedUrl: meta.file_url,
+          storedPath: f.url,
+          storedUrl: f.url,
         };
       });
 
       // Attach the first uploaded file URL directly on the order row, plus the
       // full list in metadata so the Vendor Console can view/download any file.
-      const primaryFileUrl = uploadedFileUrls[0] || null;      // Order-level payload the server persists alongside the files.
+      const primaryFileUrl = uploadedFiles[0]?.url || '';
+
+      // Mint the same daily pickup token the old /api/upload route generated —
+      // print_jobs.token_number is NOT NULL, so the direct browser insert
+      // must supply it or Postgres rejects the row (23502).
+      const tokenNumber = await mintTokenNumber(supabase, shop?.id || null);
+
+      // Order-level payload the server persists alongside the files.
       // Keys are standard snake_case to match the Supabase Postgres schema —
       // camelCase keys here caused endless PGRST204 column-drop retries.
       const orderPayload = {
         // Customer
         shop_id: shop?.id || null,
+        token_number: tokenNumber,
         shop_slug: slug,
         customer_name: name.trim(),
         customer_phone: phone.trim(),
@@ -1080,7 +1121,7 @@ export default function ShopUploadPage({ params }) {
         // JSONB sidecar — everything that isn't a row column lands here.
         metadata: {
           file_urls: uploadedFileUrls,
-          uploaded_files: uploadedFilesMetadata.map(({ file_obj, ...rest }) => rest),
+          uploaded_files: uploadedFiles,
           page_specs: filesMetadata,
           raw_specs: {
             paper_size: activePaper?.id || 'A4',
@@ -1114,10 +1155,23 @@ export default function ShopUploadPage({ params }) {
 
         if (!attemptRes.error) { res = attemptRes; break; }
 
+        // 23502 = NOT NULL violation — the live table requires a column the
+        // payload doesn't carry (observed with token_number). Inject the same
+        // legacy token the old /api/upload route generated and retry.
+        if (
+          attemptRes.error.code === '23502' &&
+          /token_number/.test(attemptRes.error.message || '') &&
+          insertPayload.token_number === undefined
+        ) {
+          insertPayload.token_number = `#TK-${Math.floor(Math.random() * 90) + 10}`;
+          continue;
+        }
+
         // PGRST204 → "Could not find the 'X' column of 'print_jobs' …"
         const missingCol =
           attemptRes.error.code === 'PGRST204'
-            ? (String(attemptRes.error.message || '').match(/'([^']+)'/) || [])[1]
+            ? (String(attemptRes.error.details || '').match(/column "(\w+)"/) || [])[1]
+              || (String(attemptRes.error.message || '').match(/'([^']+)'/) || [])[1]
             : null;
 
         // Anything else (RLS, constraints, network) — surface it unchanged.
