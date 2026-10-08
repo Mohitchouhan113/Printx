@@ -889,8 +889,9 @@ export default function ShopUploadPage({ params }) {
     // Keep the failure message stable for the form error surface while also
     // being explicit about what was checked, so the "At least one file is
     // required" path never depends on a stale or mis-named state variable.
-    const activeFiles = Array.isArray(filesList) ? filesList : [];
-    if (!activeFiles.length) {
+    const currentFiles = Array.isArray(filesList) ? [...filesList] : [];
+    const activeFiles = currentFiles;
+    if (!currentFiles.length) {
       throw new Error('At least one file is required');
     }
 
@@ -956,55 +957,60 @@ export default function ShopUploadPage({ params }) {
 
       // Direct client-side upload to Supabase Storage so large orders no
       // longer funnel through a 300MB FormData round-trip over /api/upload.
-      const uploadedUrls = await Promise.all(
-        activeFiles.map(async (f, i) => {
-          const file = f.file || f;
-          const filePath = `orders/${Date.now()}_${i}_${file.name.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
+      const activeFiles = currentFiles;
+      const uploadedFileUrls = [];
+      for (const item of activeFiles) {
+        const rawFile = item.file || item;
+        if (!rawFile || !(rawFile instanceof File)) continue;
 
-          const { data: uploadData, error: uploadErr } = await supabase
-            .storage
-            .from('print-files')
-            .upload(filePath, file, { upsert: true });
+        const path = `orders/${Date.now()}_${rawFile.name.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
+        const { data: uploadData, error: uploadErr } = await supabase
+          .storage
+          .from('print-files')
+          .upload(path, rawFile, { upsert: true });
 
-          if (uploadErr) throw uploadErr;
+        if (uploadErr) {
+          console.error('Storage Upload Error:', uploadErr);
+          throw new Error('Failed to upload ' + rawFile.name);
+        }
 
-          const { data: urlData } = supabase
-            .storage
-            .from('print-files')
-            .getPublicUrl(uploadData.path);
+        const { data: urlData } = supabase
+          .storage
+          .from('print-files')
+          .getPublicUrl(uploadData.path);
 
-          return {
-            name: f.name,
-            url: urlData?.publicUrl,
-            path: uploadData.path,
-            size: file.size,
-          };
-        })
-      );
+        uploadedFileUrls.push(urlData?.publicUrl);
+      }
 
-      // Keep a stable, always-defined list of file URLs for the order payload.
-      // This avoids the "uploadedFileUrls is not defined" path when the upload
-      // block is skipped, re-run, or partially reset.
-      const uploadedFileUrls = Array.isArray(uploadedUrls) ? uploadedUrls.map((u) => u.url) : [];
-      const uploadedFileRecords = Array.isArray(uploadedUrls) ? uploadedUrls : [];
+      if (uploadedFileUrls.length === 0) {
+        throw new Error('At least one valid file is required for upload');
+      }
+
+      // Attach the first uploaded file URL directly on the order row, plus the
+      // full list in metadata so the Vendor Console can view/download any file.
+      const primaryFileUrl = uploadedFileUrls[0] || null;
 
       // Build the metadata payload the server uses to create the
       // print_jobs row and the per-file page/bw/color math.
-      const filesMetadata = filesList.map((item, idx) => {
-        const s = fileSplit(item, RATES, { printSpecific, pageRangeInput });
-        return {
-          index: idx,
-          fileName: item.name,
-          pageCount: s.effPages,
-          colorMode: item.config.colorMode,
-          sides: item.config.sides,
-          copies: item.config.copies,
-          bwPages: s.bwPages,
-          colorPages: s.colorPages,
-          storedPath: uploadedUrls[idx]?.path,
-          storedUrl: uploadedUrls[idx]?.url,
-        };
-      });
+      const filesMetadata = Array.isArray(uploadedFileUrls)
+        ? uploadedFileUrls.map((url, idx) => {
+            const item = currentFiles[idx] || {};
+            const rawFile = item.file || item;
+            const s = fileSplit(item, RATES, { printSpecific, pageRangeInput });
+            return {
+              index: idx,
+              fileName: rawFile?.name || item.name || `file_${idx + 1}`,
+              pageCount: s.effPages,
+              colorMode: item.config?.colorMode || 'B/W',
+              sides: item.config?.sides || 'single',
+              copies: item.config?.copies || 1,
+              bwPages: s.bwPages,
+              colorPages: s.colorPages,
+              storedPath: url,
+              storedUrl: url,
+            };
+          })
+        : [];
 
       // Order-level payload the server persists alongside the files.
       const orderPayload = {
@@ -1059,6 +1065,15 @@ export default function ShopUploadPage({ params }) {
         // per file, but the server-side order INSERT still needs to dedupe so
         // a stale retry never creates two paid tokens for the same request.
         idempotencyKey: `px-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
+
+        // Primary file URL attached directly on the order row so the vendor
+        // console can view/download the first file without parsing metadata.
+        file_url: primaryFileUrl,
+
+        // Full per-file URL list persisted in metadata for the Vendor Console.
+        metadata: {
+          file_urls: uploadedFileUrls,
+        },
 
         // File URLs persisted with the order so the server (and any future
         // download/view flows) can resolve stored files even if the client
