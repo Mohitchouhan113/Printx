@@ -1090,10 +1090,34 @@ export default function ShopUploadPage({ params }) {
       // No /api/upload call here — order files are uploaded directly to Supabase
       // Storage in the loop above. The server is told about the order through the
       // Supabase insert path, not through a multipart/form-data POST to /api/upload.
+
+      // PGRST204 safety: if the live DB schema hasn't caught up with this client's
+      // optional columns yet, PostgREST will throw "column X of table print_jobs
+      // does not exist". Strip any missing optional write-time columns before the
+      // insert so a schema lag never blocks order placement, and keep the coupon
+      // value alive in metadata if `applied_coupon` is absent.
+      const insertPayload = { ...orderPayload };
+      if (insertPayload.appliedCoupon !== undefined) {
+        try {
+          await supabase
+            .from('print_jobs')
+            .insert({ applied_coupon: insertPayload.appliedCoupon }, { returning: 'minimal' });
+          // Column exists — keep it on the final insert payload.
+        } catch (colCheck) {
+          const missing = /column "applied_coupon" of table "print_jobs" does not exist/i.test(colCheck?.message ?? '');
+          if (missing) {
+            delete insertPayload.appliedCoupon;
+            // Preserve the value for the vendor console / any metadata consumers.
+            if (!insertPayload.metadata) insertPayload.metadata = {};
+            insertPayload.metadata.applied_coupon = insertPayload.appliedCoupon ?? '';
+          }
+        }
+      }
+
       const res = await supabase
         .from('print_jobs')
         .insert({
-          ...orderPayload,
+          ...insertPayload,
           filesMetadata: uploadedFilesMetadata,
           file_url: uploadedFilesMetadata[0]?.file_url || null,
         })
