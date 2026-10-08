@@ -87,48 +87,70 @@ function applyKnownColumns(payload) {
 
 export async function POST(request) {
   try {
-    const formData = await request.formData();
-    const customerName = String(formData.get('customerName') || '').trim();
-    const customerPhone = String(formData.get('customerPhone') || '').trim();
-    const shopSlug = String(formData.get('shopSlug') || '').trim();
+    /* ------------------------------------------------------------------
+     * Detect payload type:
+     *   JSON  — new path: client already uploaded files to Supabase Storage
+     *           and sends { fileUrls, filesMetadata, customerName, … }
+     *   FormData — legacy path: raw file bytes in the request body
+     *
+     * The JSON path is the primary path for 300 MB support: the browser
+     * uploads directly to Supabase Storage (no Next.js body limit hit),
+     * then sends only URLs + metadata here.
+     * ------------------------------------------------------------------ */
+    const contentType = request.headers.get('content-type') || '';
+    const isJsonPayload = contentType.includes('application/json');
+
+    let body = {};
+    let formData = null;
+
+    if (isJsonPayload) {
+      body = await request.json();
+    } else {
+      formData = await request.formData();
+    }
+
+    // Helper: read a field from whichever source is active
+    const field = (key, fallback = '') =>
+      isJsonPayload
+        ? (body[key] ?? fallback)
+        : String(formData.get(key) ?? fallback);
+
+    const customerName = String(field('customerName', '')).trim();
+    const customerPhone = String(field('customerPhone', '')).trim();
+    const shopSlug = String(field('shopSlug', '')).trim();
 
     // Pricing snapshot (optional — sent by the customer page)
-    const originalPrice = parseFloat(formData.get('originalPrice') || '0') || null;
-    const discountAmount = parseFloat(formData.get('discountAmount') || '0') || null;
-    const appliedCoupon = String(formData.get('appliedCoupon') || '').trim() || null;
-    const finalPrice = parseFloat(formData.get('finalPrice') || '0') || null;
+    const originalPrice = parseFloat(field('originalPrice', '0')) || null;
+    const discountAmount = parseFloat(field('discountAmount', '0')) || null;
+    const appliedCoupon = String(field('appliedCoupon', '')).trim() || null;
+    const finalPrice = parseFloat(field('finalPrice', '0')) || null;
 
     // Binding & finishing (order-level, optional — legacy clients omit it)
-    const bindingType = String(formData.get('bindingType') || 'none').trim() || 'none';
-    const bindingCost = parseFloat(formData.get('bindingCost') || '0') || 0;
+    const bindingType = String(field('bindingType', 'none')).trim() || 'none';
+    const bindingCost = parseFloat(field('bindingCost', '0')) || 0;
     // Paper tray selection (orders.paper_size — determines which tray to load)
-    const paperSize = String(formData.get('paperSize') || 'A4').trim() || 'A4';
+    const paperSize = String(field('paperSize', 'A4')).trim() || 'A4';
 
     // ⚡ Priority Express Print (+₹10) — orders.is_priority (+ print_type carrier)
     const isPriority = ['1', 'true', 'yes', 'on'].includes(
-      String(formData.get('isPriority') || '').trim().toLowerCase()
+      String(field('isPriority', '')).trim().toLowerCase()
     );
 
     // Selective page range from the customer page — 'all' or "1-5, 8, 11-15"
-    const pageRange = String(formData.get('pageRange') || 'all').trim() || 'all';
+    const pageRange = String(field('pageRange', 'all')).trim() || 'all';
 
-    // Smart AI color split totals from the client-side pixel scan →
-    // orders.bw_pages / orders.color_pages (NaN-safe; absent on legacy clients)
-    const bwPagesTotal = parseInt(formData.get('bwPages') ?? '', 10);
-    const colorPagesTotal = parseInt(formData.get('colorPages') ?? '', 10);
+    // Smart AI color split totals from the client-side pixel scan
+    const bwPagesTotal = parseInt(String(field('bwPages', '')), 10);
+    const colorPagesTotal = parseInt(String(field('colorPages', '')), 10);
 
-    // Special instructions / notes from the customer — stored in both
-    // print_jobs and orders so every read path finds them.
-    const userNote = String(formData.get('notes') || '').trim() || null;
+    // Special instructions / notes from the customer
+    const userNote = String(field('notes', '')).trim() || null;
 
     console.log('📦 CREATING ORDER WITH NOTES:', userNote);
 
     // Payment selection from the mandatory Step 2
-    const paymentStatus = String(formData.get('paymentStatus') || 'UNPAID').trim().toUpperCase();
-    const paymentMode = String(formData.get('paymentMode') || 'CASH').trim().toUpperCase();
-    // PENDING_VERIFICATION + UPI_INTENT = direct UPI app deep-link checkout
-    // (order is saved as a draft when the customer taps a UPI app button and
-    // confirmed by /api/payment/confirm-direct-upi on window focus return).
+    const paymentStatus = String(field('paymentStatus', 'UNPAID')).trim().toUpperCase();
+    const paymentMode = String(field('paymentMode', 'CASH')).trim().toUpperCase();
     if (
       !['PAID', 'UNPAID', 'PENDING_VERIFICATION'].includes(paymentStatus) ||
       !['RAZORPAY', 'CASH', 'WALLET', 'UPI_INTENT'].includes(paymentMode)
@@ -140,18 +162,42 @@ export async function POST(request) {
     }
 
     /* ------------------------------------------------------------------ */
-    /* Detect multi-file vs legacy single-file                             */
+    /* Detect payload type: JSON pre-uploaded vs FormData with raw files   */
     /* ------------------------------------------------------------------ */
-    const filesMetadataRaw = formData.get('filesMetadata');
-    const multiFiles = formData.getAll('files');
-    const legacyFile = formData.get('file');
 
-    const isMultiFile = filesMetadataRaw && multiFiles.length > 0;
+    // JSON path: client already uploaded files to Supabase Storage and is
+    // sending { fileUrls: [{fileUrl, fileName}], filesMetadata: [...] }.
+    // No storage upload needed here — skip straight to DB inserts.
+    const preUploadedUrls = isJsonPayload && Array.isArray(body.fileUrls) ? body.fileUrls : null;
+
+    const filesMetadataRaw = isJsonPayload
+      ? JSON.stringify(body.filesMetadata || [])
+      : formData?.get('filesMetadata');
+    const multiFiles = isJsonPayload ? [] : (formData?.getAll('files') || []);
+    const legacyFile = isJsonPayload ? null : formData?.get('file');
+
+    const isMultiFile = !isJsonPayload && filesMetadataRaw && multiFiles.length > 0;
 
     let filesToUpload = [];
     let filesMetadata = [];
 
-    if (isMultiFile) {
+    if (preUploadedUrls) {
+      /* ---- JSON path: pre-uploaded URLs, no raw file bytes ---- */
+      const meta = Array.isArray(body.filesMetadata) ? body.filesMetadata : [];
+      preUploadedUrls.forEach((u, i) => {
+        const m = meta[i] || {};
+        filesToUpload.push({
+          file: null,               // no blob — already in storage
+          fileName: u.fileName || m.fileName || `file-${i}`,
+          pageCount: m.pageCount || 1,
+          colorMode: m.colorMode || 'auto',
+          sides: m.sides || 'single',
+          copies: m.copies || 1,
+          preUploadedUrl: u.fileUrl || null,
+        });
+      });
+      filesMetadata = meta;
+    } else if (isMultiFile) {
       /* ---- Multi-file batch ---- */
       try {
         filesMetadata = JSON.parse(String(filesMetadataRaw));
@@ -200,7 +246,6 @@ export async function POST(request) {
       });
     }
 
-    /* ------------------------- Validation ------------------------- */
     if (filesToUpload.length === 0) {
       return NextResponse.json({ success: false, error: 'At least one file is required' }, { status: 400 });
     }
@@ -214,19 +259,21 @@ export async function POST(request) {
       return NextResponse.json({ success: false, error: 'Shop slug is required' }, { status: 400 });
     }
 
-    // Validate each file
-    for (const { file: f, fileName } of filesToUpload) {
-      if (!ALLOWED_MIME.has(f.type)) {
-        return NextResponse.json(
-          { success: false, error: `"${fileName}" — only PDF, PNG, JPG or DOCX files are allowed` },
-          { status: 415 }
-        );
-      }
-      if (f.size > MAX_SIZE_BYTES) {
-        return NextResponse.json(
-          { success: false, error: `"${fileName}" exceeds 300MB limit` },
-          { status: 413 }
-        );
+    // Validate each file — only when raw blobs are present (FormData path)
+    if (!preUploadedUrls) {
+      for (const { file: f, fileName } of filesToUpload) {
+        if (!ALLOWED_MIME.has(f.type)) {
+          return NextResponse.json(
+            { success: false, error: `"${fileName}" — only PDF, PNG, JPG or DOCX files are allowed` },
+            { status: 415 }
+          );
+        }
+        if (f.size > MAX_SIZE_BYTES) {
+          return NextResponse.json(
+            { success: false, error: `"${fileName}" exceeds 300MB limit` },
+            { status: 413 }
+          );
+        }
       }
     }
 
@@ -466,7 +513,22 @@ export async function POST(request) {
     const uploadedFiles = [];
     let storageFailures = 0;
 
-    for (const { file: f, fileName, pageCount, colorMode, sides, copies } of filesToUpload) {
+    for (const { file: f, fileName, pageCount, colorMode, sides, copies, preUploadedUrl } of filesToUpload) {
+      // JSON path: file was already uploaded to Supabase Storage by the browser.
+      // Use the pre-uploaded URL directly — no server-side storage upload needed.
+      if (preUploadedUrl !== undefined) {
+        uploadedFiles.push({
+          fileUrl: preUploadedUrl,
+          fileName,
+          pageCount,
+          colorMode,
+          sides,
+          copies,
+          storagePath: null,
+        });
+        continue;
+      }
+
       const safeName = fileName.replace(/[^\w.\-() ]/g, '_').slice(-120);
       let stored = false;
 

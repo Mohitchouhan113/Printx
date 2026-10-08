@@ -949,92 +949,118 @@ export default function ShopUploadPage({ params }) {
         setWalletBalance(walletData.balance);
       }
 
-      // Build a single FormData with all files — background-compressed bytes
-      // when the optimizer already finished, original bytes otherwise.
-      const fd = new FormData();
-      filesList.forEach(({ file, uploadFile }) => {
-        fd.append('files', uploadFile || file); // multiple files under same key
-      });
-      fd.append('customerName', name.trim());
-      fd.append('customerPhone', phone.trim());
-      fd.append('shopSlug', slug);
+      // Direct client-side upload to Supabase Storage so large orders no
+      // longer funnel through a 300MB FormData round-trip over /api/upload.
+      const uploadedUrls = [];
+      for (let i = 0; i < filesList.length; i++) {
+        const item = filesList[i];
+        const file = item.file;
+        const filePath = `orders/${Date.now()}_${i}_${file.name.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
 
-      // Per-file metadata array
+        const { data: uploadData, error: uploadErr } = await supabase
+          .storage
+          .from('print-files')
+          .upload(filePath, file, { upsert: true });
+
+        if (uploadErr) throw uploadErr;
+
+        const { data: urlData } = supabase
+          .storage
+          .from('print-files')
+          .getPublicUrl(uploadData.path);
+
+        uploadedUrls.push({
+          url: urlData?.publicUrl,
+          path: uploadData.path,
+          name: item.name,
+        });
+      }
+
+      // Build the metadata payload the server uses to create the
+      // print_jobs row and the per-file page/bw/color math.
       const filesMetadata = filesList.map((item, idx) => {
-        // Printed pages + BW/COLOR split per file (range-aware, scan-aware)
         const s = fileSplit(item, RATES, { printSpecific, pageRangeInput });
         return {
           index: idx,
           fileName: item.name,
-          pageCount: s.effPages, // pages actually being printed
+          pageCount: s.effPages,
           colorMode: item.config.colorMode,
           sides: item.config.sides,
           copies: item.config.copies,
           bwPages: s.bwPages,
           colorPages: s.colorPages,
+          storedPath: uploadedUrls[idx]?.path,
+          storedUrl: uploadedUrls[idx]?.url,
         };
       });
-      fd.append('filesMetadata', JSON.stringify(filesMetadata));
 
-      // Pricing snapshot for the print_jobs row
-      fd.append('originalPrice', String(billing.basePrice || 0));
-      fd.append('discountAmount', String((billing.volumeDiscount || 0) + (billing.couponDiscount || 0)));
-      fd.append('appliedCoupon', coupon?.code || '');
-      fd.append('finalPrice', String(billing.finalPrice || 0));
+      // Order-level payload the server persists alongside the files.
+      const orderPayload = {
+        // Customer
+        customerName: name.trim(),
+        customerPhone: phone.trim(),
+        shopSlug: slug,
 
-      // Binding & finishing (order-level)
-      fd.append('bindingType', billing.bindingType);
-      fd.append('bindingCost', String(billing.bindingCost || 0));
+        // Pricing snapshot for the print_jobs row
+        originalPrice: String(billing.basePrice || 0),
+        discountAmount: String((billing.volumeDiscount || 0) + (billing.couponDiscount || 0)),
+        appliedCoupon: coupon?.code || '',
+        finalPrice: String(billing.finalPrice || 0),
 
-      // Paper tray selection — persisted into the orders row
-      fd.append('paperSize', activePaper?.id || 'A4');
+        // Payment selection from Step 2 (mandatory)
+        paymentStatus: chosenPayment.payment_status,
+        paymentMode: chosenPayment.payment_mode,
 
-      // ⚡ Priority Express Print (+₹10) — orders.is_priority
-      fd.append('isPriority', isPriority ? '1' : '0');
+        // Binding & finishing (order-level)
+        bindingType: billing.bindingType,
+        bindingCost: String(billing.bindingCost || 0),
 
-      // Selective page range — 'all' or e.g. "1-5, 8, 11-15" (orders.page_range)
-      fd.append('pageRange', pageRangeValue);
+        // Paper tray selection — persisted into the orders row
+        paperSize: activePaper?.id || 'A4',
 
-      // Special instructions from the customer (orders.notes)
-      // Merge per-file color-page notes (from FileConfigCard) with the global notes field.
-      const colorNotes = filesList
-        .map((item, idx) => {
-          const cn = (item.config.colorPagesNote || '').trim();
-          return cn ? (filesList.length > 1 ? `File ${idx + 1}: ${cn}` : cn) : null;
-        })
-        .filter(Boolean)
-        .join('; ');
-      const combinedNotes = [notes.trim(), colorNotes].filter(Boolean).join(' | ');
-      fd.append('notes', combinedNotes);
+        // ⚡ Priority Express Print (+₹10) — orders.is_priority
+        isPriority: isPriority ? '1' : '0',
 
-      // Smart AI color split — explicit totals → orders.bw_pages / color_pages
-      fd.append('bwPages', String(rawPages.totalBwPages));
-      fd.append('colorPages', String(rawPages.totalColorPages));
+        // Selective page range — 'all' or e.g. "1-5, 8, 11-15" (orders.page_range)
+        pageRange: pageRangeValue,
 
-      // Payment selection from Step 2 (mandatory)
-      fd.append('paymentStatus', chosenPayment.payment_status); // PAID | UNPAID
-      fd.append('paymentMode', chosenPayment.payment_mode);     // RAZORPAY | CASH
+        // Special instructions from the customer (orders.notes)
+        notes: [
+          notes.trim(),
+          filesList
+            .map((item, idx) => {
+              const cn = (item.config.colorPagesNote || '').trim();
+              return cn ? (filesList.length > 1 ? `File ${idx + 1}: ${cn}` : cn) : null;
+            })
+            .filter(Boolean)
+            .join('; '),
+        ]
+          .filter(Boolean)
+          .join(' | '),
 
-      // Idempotency key — one logical order submission, generated once per
-      // submitOrder call. On 2G the transport may transparently resend the
-      // FormData after a dropped packet; this header lets the server (and
-      // any future proxy) dedupe so the customer never gets two tokens.
-      const idemKey = `px-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+        // Smart AI color split — explicit totals → orders.bw_pages / color_pages
+        bwPages: String(rawPages.totalBwPages),
+        colorPages: String(rawPages.totalColorPages),
 
-      // Resilient POST: 3-tier exponential backoff for transport-level
-      // failures (dropped packets on 2G/3G — the POST is replayable because
-      // of the Idempotency-Key above). Server-rejected responses (4xx/5xx
-      // after final attempt) still flow to the existing error handling.
+        // Idempotency key — one logical order submission, generated once per
+        // submitOrder call. Direct Storage uploads are per-file and replayable
+        // per file, but the server-side order INSERT still needs to dedupe so
+        // a stale retry never creates two paid tokens for the same request.
+        idempotencyKey: `px-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
+      };
+
+      // Resilient POST of the metadata order row — the files already landed
+      // in Supabase Storage, so this one only carries JSON, not 300MB of
+      // FormData. The server matches uploaded files to the job by the stored
+      // paths we send in filesMetadata.
       const res = await fetchWithRetry(
         '/api/upload',
         {
           method: 'POST',
-          body: fd,
-          headers: { 'Idempotency-Key': idemKey },
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ filesMetadata, ...orderPayload }),
         },
-        { idempotencyKey: idemKey, onRetry: ({ attempt, delayMs }) => {
-          // Keep the customer informed without alarming them — the UI stays
-          // on the submitting step; the retry just takes a breath.
+        { idempotencyKey: orderPayload.idempotencyKey, onRetry: ({ attempt, delayMs }) => {
           console.warn(`[upload] retry ${attempt} in ${delayMs}ms (unstable network)`);
         } }
       );
