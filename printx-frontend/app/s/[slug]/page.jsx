@@ -958,59 +958,65 @@ export default function ShopUploadPage({ params }) {
       // Direct client-side upload to Supabase Storage so large orders no
       // longer funnel through a 300MB FormData round-trip over /api/upload.
       const activeFiles = currentFiles;
-      const uploadedFileUrls = [];
+      const uploadedFilesMetadata = [];
       for (const item of activeFiles) {
-        const rawFile = item.file || item;
-        if (!rawFile || !(rawFile instanceof File)) continue;
+        const fileObj = item.file || item.rawFile || item;
+        if (!fileObj || !(fileObj instanceof File || fileObj instanceof Blob)) continue;
 
-        const path = `orders/${Date.now()}_${rawFile.name.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
+        const cleanName = fileObj.name ? fileObj.name.replace(/[^a-zA-Z0-9.-]/g, '_') : 'file.pdf';
+        const filePath = `orders/${Date.now()}_${cleanName}`;
+
         const { data: uploadData, error: uploadErr } = await supabase
           .storage
           .from('print-files')
-          .upload(path, rawFile, { upsert: true });
+          .upload(filePath, fileObj, { upsert: true });
 
         if (uploadErr) {
-          console.error('Storage Upload Error:', uploadErr);
-          throw new Error('Failed to upload ' + rawFile.name);
+          console.error('Supabase Storage Error:', uploadErr);
+          throw new Error('Failed to upload ' + cleanName);
         }
 
-        const { data: urlData } = supabase
+        const { data: publicUrlData } = supabase
           .storage
           .from('print-files')
-          .getPublicUrl(uploadData.path);
+          .getPublicUrl(filePath);
 
-        uploadedFileUrls.push(urlData?.publicUrl);
+        uploadedFilesMetadata.push({
+          file_obj: fileObj,
+          file_url: publicUrlData.publicUrl,
+          file_name: cleanName,
+          file_size: fileObj.size || 0,
+        });
       }
 
-      if (uploadedFileUrls.length === 0) {
-        throw new Error('At least one valid file is required for upload');
+      if (uploadedFilesMetadata.length === 0) {
+        throw new Error('Please select at least one file to upload');
       }
+
+      const uploadedFileUrls = uploadedFilesMetadata.map((m) => m.file_url);
+
+      // Build the metadata payload the server uses to create the
+      // print_jobs row and the per-file page/bw/color math.
+      const filesMetadata = uploadedFilesMetadata.map((meta, idx) => {
+        const item = currentFiles[idx] || {};
+        const s = fileSplit(meta.fileObj || item, RATES, { printSpecific, pageRangeInput });
+        return {
+          index: idx,
+          fileName: meta.file_name || item.name || `file_${idx + 1}`,
+          pageCount: s.effPages,
+          colorMode: meta.colorMode || item.config?.colorMode || 'B/W',
+          sides: meta.sides || item.config?.sides || 'single',
+          copies: meta.copies || item.config?.copies || 1,
+          bwPages: s.bwPages,
+          colorPages: s.colorPages,
+          storedPath: meta.file_url,
+          storedUrl: meta.file_url,
+        };
+      });
 
       // Attach the first uploaded file URL directly on the order row, plus the
       // full list in metadata so the Vendor Console can view/download any file.
       const primaryFileUrl = uploadedFileUrls[0] || null;
-
-      // Build the metadata payload the server uses to create the
-      // print_jobs row and the per-file page/bw/color math.
-      const filesMetadata = Array.isArray(uploadedFileUrls)
-        ? uploadedFileUrls.map((url, idx) => {
-            const item = currentFiles[idx] || {};
-            const rawFile = item.file || item;
-            const s = fileSplit(item, RATES, { printSpecific, pageRangeInput });
-            return {
-              index: idx,
-              fileName: rawFile?.name || item.name || `file_${idx + 1}`,
-              pageCount: s.effPages,
-              colorMode: item.config?.colorMode || 'B/W',
-              sides: item.config?.sides || 'single',
-              copies: item.config?.copies || 1,
-              bwPages: s.bwPages,
-              colorPages: s.colorPages,
-              storedPath: url,
-              storedUrl: url,
-            };
-          })
-        : [];
 
       // Order-level payload the server persists alongside the files.
       const orderPayload = {
@@ -1081,24 +1087,28 @@ export default function ShopUploadPage({ params }) {
         uploadedFileUrls,
       };
 
-      // Resilient POST of the metadata order row — the files already landed
-      // in Supabase Storage, so this one only carries JSON, not 300MB of
-      // FormData. The server matches uploaded files to the job by the stored
-      // paths we send in filesMetadata.
-      const res = await fetchWithRetry(
-        '/api/upload',
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ filesMetadata, ...orderPayload }),
-        },
-        { idempotencyKey: orderPayload.idempotencyKey, onRetry: ({ attempt, delayMs }) => {
-          console.warn(`[upload] retry ${attempt} in ${delayMs}ms (unstable network)`);
-        } }
-      );
-      const data = await res.json();
+      // No /api/upload call here — order files are uploaded directly to Supabase
+      // Storage in the loop above. The server is told about the order through the
+      // Supabase insert path, not through a multipart/form-data POST to /api/upload.
+      const res = await supabase
+        .from('print_jobs')
+        .insert({
+          ...orderPayload,
+          filesMetadata: uploadedFilesMetadata,
+          file_url: uploadedFilesMetadata[0]?.file_url || null,
+        })
+        .select('*')
+        .single();
 
-      if (!res.ok || !data.success) {
+      if (res.error) {
+        console.error('Order insert error:', res.error);
+        throw new Error(res.error.message || 'Order creation failed');
+      }
+
+      const data = res.data ? { success: true, tokenNumber: res.data.token_number, tokenNo: res.data.token_no, jobId: res.data.id } : { success: false };
+      const resOk = res.ok && data.success;
+
+      if (!resOk) {
         // STRICT MODE: the order was NOT persisted (DB insert failed, shop
         // suspended, bucket rejected, …). Never continue to the success
         // screen with a token that exists in no database row — tell the
