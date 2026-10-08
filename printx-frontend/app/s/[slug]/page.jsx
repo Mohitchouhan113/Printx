@@ -982,7 +982,7 @@ export default function ShopUploadPage({ params }) {
         const walletData = await walletRes.json();
         if (!walletData.success) {
           setStep('payment');
-          throw new Error(walletData.error || 'Wallet payment failed — insufficient balance');
+          throw new Error(`Wallet Payment Failed: ${walletData.error || 'insufficient balance'}`);
         }
         // Update local balance after deduction
         setWalletBalance(walletData.balance);
@@ -1007,8 +1007,8 @@ export default function ShopUploadPage({ params }) {
           .upload(filePath, rawFile, { upsert: true });
 
         if (uploadErr) {
-          console.error('Storage Upload Failed:', uploadErr);
-          throw new Error('Upload failed for ' + cleanFileName);
+          console.error('Storage Upload Detailed Error:', { file: cleanFileName, ...uploadErr });
+          throw new Error(`Storage Upload Failed: ${uploadErr.message || cleanFileName}`);
         }
 
         const { data: urlData } = supabase
@@ -1024,7 +1024,7 @@ export default function ShopUploadPage({ params }) {
       }
 
       if (uploadedFiles.length === 0) {
-        throw new Error('Please select at least one valid file.');
+        throw new Error('Please select at least one valid file to upload.');
       }
 
       const uploadedFileUrls = uploadedFiles.map((f) => f.url);
@@ -1199,14 +1199,14 @@ export default function ShopUploadPage({ params }) {
         // Full PostgREST error surface (code / message / details / hint) plus
         // the keys we attempted to write — enough to diagnose schema drift,
         // RLS rejection or a constraint straight from the browser console.
-        console.error('CRITICAL SUPABASE INSERT ERROR:', {
+        console.error('Supabase DB Insert Error:', {
           code: res.error.code,
           message: res.error.message,
           details: res.error.details,
           hint: res.error.hint,
           payloadKeys: Object.keys(insertPayload),
         });
-        throw new Error(res.error.message || 'Order creation failed');
+        throw new Error(`Database Insert Failed: ${res.error.message || 'no detail returned by PostgREST'}`);
       }
 
       const data = res.data ? { success: true, tokenNumber: res.data.token_number, tokenNo: res.data.token_no, jobId: res.data.id } : { success: false };
@@ -1218,7 +1218,7 @@ export default function ShopUploadPage({ params }) {
         // screen with a token that exists in no database row — tell the
         // customer the placement failed so they can retry or pay at the
         // counter instead of waiting forever for a print that never queued.
-        throw new Error(data.error || 'Order placement failed, please try again.');
+        throw new Error(data.error || 'Order insert returned no row — nothing was saved. Check the console for "Supabase DB Insert Error".');
       }
 
       // Cross-tab instant notification — the vendor dashboard in another tab
@@ -1305,9 +1305,9 @@ export default function ShopUploadPage({ params }) {
       // Every failure path converges here — log the EXACT error (message,
       // stack and any Supabase fields) so a silent order failure is always
       // diagnosable from the browser console, and surface the exact message.
-      console.error('EXACT SUBMIT ORDER ERROR:', err);
+      console.error('EXACT SUBMIT ERROR LOG:', err);
       try { err.printxLogged = true; } catch { /* frozen error object */ }
-      setSubmitError(err?.message || 'Order placement failed, please try again.');
+      setSubmitError(err?.message || 'An unexpected error occurred during order submission.');
       throw err;
     }
   };
@@ -1319,8 +1319,8 @@ export default function ShopUploadPage({ params }) {
     } catch (err) {
       // Safety net for errors thrown before submitOrder's own try block
       // (payment/file guards) or any future caller — log once, never silently.
-      if (!err?.printxLogged) console.error('EXACT SUBMIT ORDER ERROR:', err);
-      setSubmitError(err?.message || 'Order placement failed, please try again.');
+      if (!err?.printxLogged) console.error('EXACT SUBMIT ERROR LOG:', err);
+      setSubmitError(err?.message || 'An unexpected error occurred during order submission.');
     }
   };
 
