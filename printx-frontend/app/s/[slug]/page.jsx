@@ -982,7 +982,11 @@ export default function ShopUploadPage({ params }) {
         })
       );
 
-      uploadedFileUrls = uploadedUrls.map((u) => u.url);
+      // Keep a stable, always-defined list of file URLs for the order payload.
+      // This avoids the "uploadedFileUrls is not defined" path when the upload
+      // block is skipped, re-run, or partially reset.
+      const uploadedFileUrls = Array.isArray(uploadedUrls) ? uploadedUrls.map((u) => u.url) : [];
+      const uploadedFileRecords = Array.isArray(uploadedUrls) ? uploadedUrls : [];
 
       // Build the metadata payload the server uses to create the
       // print_jobs row and the per-file page/bw/color math.
