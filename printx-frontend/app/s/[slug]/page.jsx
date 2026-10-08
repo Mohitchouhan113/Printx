@@ -1091,38 +1091,51 @@ export default function ShopUploadPage({ params }) {
       // Storage in the loop above. The server is told about the order through the
       // Supabase insert path, not through a multipart/form-data POST to /api/upload.
 
-      // PGRST204 safety: if the live DB schema hasn't caught up with this client's
-      // optional columns yet, PostgREST will throw "column X of table print_jobs
-      // does not exist". Strip any missing optional write-time columns before the
-      // insert so a schema lag never blocks order placement, and keep the coupon
-      // value alive in metadata if `applied_coupon` is absent.
-      const insertPayload = { ...orderPayload };
-      if (insertPayload.appliedCoupon !== undefined) {
-        try {
-          await supabase
-            .from('print_jobs')
-            .insert({ applied_coupon: insertPayload.appliedCoupon }, { returning: 'minimal' });
-          // Column exists — keep it on the final insert payload.
-        } catch (colCheck) {
-          const missing = /column "applied_coupon" of table "print_jobs" does not exist/i.test(colCheck?.message ?? '');
-          if (missing) {
-            delete insertPayload.appliedCoupon;
-            // Preserve the value for the vendor console / any metadata consumers.
-            if (!insertPayload.metadata) insertPayload.metadata = {};
-            insertPayload.metadata.applied_coupon = insertPayload.appliedCoupon ?? '';
-          }
-        }
-      }
+      // PGRST204-resilient insert: the live print_jobs schema may lag behind
+      // this client (missing bindingCost / appliedCoupon / originalPrice /
+      // discountAmount columns, …). PostgREST names the offending column in the
+      // error, so the loop below folds that value into the metadata JSONB
+      // object, drops it from the row payload, and retries until it lands.
+      // Order placement never blocks on schema drift and no data is lost.
+      const insertPayload = {
+        ...orderPayload,
+        filesMetadata: uploadedFilesMetadata.map(({ file_obj, ...rest }) => rest),
+        file_url: uploadedFilesMetadata[0]?.file_url || null,
+      };
+      if (!insertPayload.metadata) insertPayload.metadata = {};
+      // The coupons ledger (/api/coupons/validate) counts usages via the
+      // snake_case `applied_coupon` column — keep it populated even if the
+      // camelCase twin is the one the row actually stores.
+      insertPayload.metadata.applied_coupon = orderPayload.appliedCoupon ?? '';
 
-      const res = await supabase
-        .from('print_jobs')
-        .insert({
-          ...insertPayload,
-          filesMetadata: uploadedFilesMetadata,
-          file_url: uploadedFilesMetadata[0]?.file_url || null,
-        })
-        .select('*')
-        .single();
+      let res = null;
+      for (let dropAttempt = 0; dropAttempt < 15; dropAttempt++) {
+        const attemptRes = await supabase
+          .from('print_jobs')
+          .insert(insertPayload)
+          .select('*')
+          .single();
+
+        if (!attemptRes.error) { res = attemptRes; break; }
+
+        // PGRST204 → "Could not find the 'X' column of 'print_jobs' …"
+        const missingCol =
+          attemptRes.error.code === 'PGRST204'
+            ? (String(attemptRes.error.message || '').match(/'([^']+)'/) || [])[1]
+            : null;
+
+        // Anything else (RLS, constraints, network) — surface it unchanged.
+        if (!missingCol || missingCol === 'metadata' || insertPayload[missingCol] === undefined) {
+          res = attemptRes;
+          break;
+        }
+
+        console.warn(
+          `[order] print_jobs has no "${missingCol}" column — moving value into metadata and retrying.`
+        );
+        insertPayload.metadata[missingCol] = insertPayload[missingCol];
+        delete insertPayload[missingCol];
+      }
 
       if (res.error) {
         console.error('Order insert error:', res.error);
