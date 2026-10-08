@@ -31,7 +31,7 @@ import { getShopActivePlan } from '../../../lib/getShopActivePlan';
  * When Supabase env vars are absent the route runs in DEMO mode.
  */
 
-const MAX_SIZE_BYTES = 20 * 1024 * 1024;
+const MAX_SIZE_BYTES = 300 * 1024 * 1024;
 const ALLOWED_MIME = new Set([
   'application/pdf',
   'image/png',
@@ -224,7 +224,7 @@ export async function POST(request) {
       }
       if (f.size > MAX_SIZE_BYTES) {
         return NextResponse.json(
-          { success: false, error: `"${fileName}" exceeds 20MB limit` },
+          { success: false, error: `"${fileName}" exceeds 300MB limit` },
           { status: 413 }
         );
       }

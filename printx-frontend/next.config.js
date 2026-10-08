@@ -17,12 +17,15 @@ const nextConfig = {
   // Transpile pdfjs-dist for Next.js
   transpilePackages: ['pdfjs-dist'],
   // Load pdf-parse natively in Node (route: /api/whatsapp/webhook).
-  // Bundling it drags pdf-parse's NESTED pdfjs-dist legacy .mjs through
-  // webpack's harmony interop, which crashes with "Object.defineProperty
-  // called on non-object" — externalizing fixes it (plain-Node path is
-  // already proven: getText().total counts pages).
   experimental: {
     serverComponentsExternalPackages: ['pdf-parse'],
+    // Raise the App Router body-size limit to 300 MB so customers can
+    // upload large document files. The default (1 MB) would reject anything
+    // bigger before the /api/upload handler even runs.
+    // On Vercel, also set NEXT_BODY_SIZE_LIMIT=314572800 in project env vars.
+    serverActions: {
+      bodySizeLimit: '300mb',
+    },
   },
   webpack: (config, { isServer }) => {
     // Handle pdf.js worker

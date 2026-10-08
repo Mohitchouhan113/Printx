@@ -73,7 +73,7 @@ const ACCEPTED_TYPES = {
   'image/jpeg': 'jpg',
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
 };
-const MAX_SIZE_MB = 20;
+const MAX_SIZE_MB = 300;
 const MAX_SIZE_BYTES = MAX_SIZE_MB * 1024 * 1024;
 /** Multi-file batch cap — one unified transaction holds at most 5 files. */
 const MAX_FILES_PER_ORDER = 5;
