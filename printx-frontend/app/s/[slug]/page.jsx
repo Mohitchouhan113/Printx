@@ -1114,8 +1114,9 @@ export default function ShopUploadPage({ params }) {
         // retry never creates two paid tokens for the same request.
         idempotency_key: `px-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
 
-        // Primary file URL attached directly on the order row so the vendor
-        // console can view/download the first file without parsing metadata.
+        // Primary file identity on the order row — BOTH columns are NOT NULL
+        // on the live print_jobs schema (23502 without file_name).
+        file_name: uploadedFiles[0]?.name || 'document.pdf',
         file_url: primaryFileUrl || '',
 
         // JSONB sidecar — everything that isn't a row column lands here.
@@ -1156,15 +1157,22 @@ export default function ShopUploadPage({ params }) {
         if (!attemptRes.error) { res = attemptRes; break; }
 
         // 23502 = NOT NULL violation — the live table requires a column the
-        // payload doesn't carry (observed with token_number). Inject the same
-        // legacy token the old /api/upload route generated and retry.
-        if (
-          attemptRes.error.code === '23502' &&
-          /token_number/.test(attemptRes.error.message || '') &&
-          insertPayload.token_number === undefined
-        ) {
-          insertPayload.token_number = `#TK-${Math.floor(Math.random() * 90) + 10}`;
-          continue;
+        // payload doesn't carry (observed with token_number and file_name).
+        // Inject the same fallback the old /api/upload route wrote and retry.
+        if (attemptRes.error.code === '23502') {
+          const nullCol = (String(attemptRes.error.message || '').match(/null value in column "(\w+)"/) || [])[1];
+          const notNullFallbacks = {
+            token_number: `#TK-${Math.floor(Math.random() * 90) + 10}`,
+            file_name: 'document.pdf',
+            file_url: '',
+            customer_name: 'Customer',
+            notes: '',
+            status: 'unpaid',
+          };
+          if (nullCol && notNullFallbacks[nullCol] !== undefined && insertPayload[nullCol] === undefined) {
+            insertPayload[nullCol] = notNullFallbacks[nullCol];
+            continue;
+          }
         }
 
         // PGRST204 → "Could not find the 'X' column of 'print_jobs' …"
