@@ -1016,39 +1016,40 @@ export default function ShopUploadPage({ params }) {
 
       // Attach the first uploaded file URL directly on the order row, plus the
       // full list in metadata so the Vendor Console can view/download any file.
-      const primaryFileUrl = uploadedFileUrls[0] || null;
-
-      // Order-level payload the server persists alongside the files.
+      const primaryFileUrl = uploadedFileUrls[0] || null;      // Order-level payload the server persists alongside the files.
+      // Keys are standard snake_case to match the Supabase Postgres schema —
+      // camelCase keys here caused endless PGRST204 column-drop retries.
       const orderPayload = {
         // Customer
-        customerName: name.trim(),
-        customerPhone: phone.trim(),
-        shopSlug: slug,
+        shop_id: shop?.id || null,
+        shop_slug: slug,
+        customer_name: name.trim(),
+        customer_phone: phone.trim(),
 
         // Pricing snapshot for the print_jobs row
-        originalPrice: String(billing.basePrice || 0),
-        discountAmount: String((billing.volumeDiscount || 0) + (billing.couponDiscount || 0)),
-        appliedCoupon: coupon?.code || '',
-        finalPrice: String(billing.finalPrice || 0),
+        original_price: parseFloat(billing.basePrice || 0),
+        discount_amount: parseFloat((billing.volumeDiscount || 0) + (billing.couponDiscount || 0)),
+        applied_coupon: coupon?.code || '',
+        final_price: parseFloat(billing.finalPrice || 0),
 
         // Payment selection from Step 2 (mandatory)
-        paymentStatus: chosenPayment.payment_status,
-        paymentMode: chosenPayment.payment_mode,
+        payment_status: chosenPayment.payment_status,
+        payment_mode: chosenPayment.payment_mode,
 
         // Binding & finishing (order-level)
-        bindingType: billing.bindingType,
-        bindingCost: String(billing.bindingCost || 0),
+        binding_type: billing.bindingType || 'none',
+        binding_cost: parseFloat(billing.bindingCost || 0),
 
-        // Paper tray selection — persisted into the orders row
-        paperSize: activePaper?.id || 'A4',
+        // Paper tray selection
+        paper_size: activePaper?.id || 'A4',
 
-        // ⚡ Priority Express Print (+₹10) — orders.is_priority
-        isPriority: isPriority ? '1' : '0',
+        // ⚡ Priority Express Print (+₹10)
+        is_priority: isPriority ? '1' : '0',
 
-        // Selective page range — 'all' or e.g. "1-5, 8, 11-15" (orders.page_range)
-        pageRange: pageRangeValue,
+        // Selective page range — 'all' or e.g. "1-5, 8, 11-15"
+        page_range: pageRangeValue || 'all',
 
-        // Special instructions from the customer (orders.notes)
+        // Special instructions from the customer
         notes: [
           notes.trim(),
           filesList
@@ -1062,51 +1063,46 @@ export default function ShopUploadPage({ params }) {
           .filter(Boolean)
           .join(' | '),
 
-        // Smart AI color split — explicit totals → orders.bw_pages / color_pages
-        bwPages: String(rawPages.totalBwPages),
-        colorPages: String(rawPages.totalColorPages),
+        // Smart AI color split — explicit totals
+        bw_pages: parseInt(rawPages.totalBwPages || 0, 10),
+        color_pages: parseInt(rawPages.totalColorPages || 0, 10),
 
         // Idempotency key — one logical order submission, generated once per
         // submitOrder call. Direct Storage uploads are per-file and replayable
-        // per file, but the server-side order INSERT still needs to dedupe so
-        // a stale retry never creates two paid tokens for the same request.
-        idempotencyKey: `px-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
+        // per file, but the order INSERT still needs to dedupe so a stale
+        // retry never creates two paid tokens for the same request.
+        idempotency_key: `px-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
 
         // Primary file URL attached directly on the order row so the vendor
         // console can view/download the first file without parsing metadata.
-        file_url: primaryFileUrl,
+        file_url: primaryFileUrl || '',
 
-        // Full per-file URL list persisted in metadata for the Vendor Console.
+        // JSONB sidecar — everything that isn't a row column lands here.
         metadata: {
           file_urls: uploadedFileUrls,
+          uploaded_files: uploadedFilesMetadata.map(({ file_obj, ...rest }) => rest),
+          page_specs: filesMetadata,
+          raw_specs: {
+            paper_size: activePaper?.id || 'A4',
+            page_range: pageRangeValue || 'all',
+            binding: billing.bindingType || 'none',
+            is_priority: isPriority,
+          },
+          billing_breakdown: billing,
+          applied_coupon: coupon?.code || '',
         },
-
-        // File URLs persisted with the order so the server (and any future
-        // download/view flows) can resolve stored files even if the client
-        // navigates away before the order row is fully hydrated.
-        uploadedFileUrls,
       };
 
       // No /api/upload call here — order files are uploaded directly to Supabase
       // Storage in the loop above. The server is told about the order through the
       // Supabase insert path, not through a multipart/form-data POST to /api/upload.
 
-      // PGRST204-resilient insert: the live print_jobs schema may lag behind
-      // this client (missing bindingCost / appliedCoupon / originalPrice /
-      // discountAmount columns, …). PostgREST names the offending column in the
-      // error, so the loop below folds that value into the metadata JSONB
-      // object, drops it from the row payload, and retries until it lands.
-      // Order placement never blocks on schema drift and no data is lost.
-      const insertPayload = {
-        ...orderPayload,
-        filesMetadata: uploadedFilesMetadata.map(({ file_obj, ...rest }) => rest),
-        file_url: uploadedFilesMetadata[0]?.file_url || null,
-      };
-      if (!insertPayload.metadata) insertPayload.metadata = {};
-      // The coupons ledger (/api/coupons/validate) counts usages via the
-      // snake_case `applied_coupon` column — keep it populated even if the
-      // camelCase twin is the one the row actually stores.
-      insertPayload.metadata.applied_coupon = orderPayload.appliedCoupon ?? '';
+      // PGRST204-resilient insert: the snake_case payload normally lands on
+      // the first attempt now. The loop stays as a safety net — if the live
+      // schema is missing a column, PostgREST names it in the error and the
+      // value is folded into the metadata JSONB object before retrying, so
+      // schema drift never blocks order placement and no data is lost.
+      const insertPayload = { ...orderPayload };
 
       let res = null;
       for (let dropAttempt = 0; dropAttempt < 15; dropAttempt++) {
