@@ -27,6 +27,7 @@ import { PLANS } from '../../lib/plans';
 import { startCheckout } from '../../lib/razorpayCheckout';
 import { supabase, isSupabaseConfigured } from '../../lib/supabaseClient';
 import { fetchPlans, planIsActive } from '../../lib/plansStore';
+import { loadPlatformSettings } from '../../lib/adminSettings';
 import { selectStrict } from '../../lib/supabaseSelect';
 
 
@@ -142,6 +143,37 @@ function isDemoPlanId(raw) {
   return v.includes('demo') || v.includes('sharma');
 }
 
+/**
+ * Which plans a vendor is allowed to see.
+ *
+ * @param {Array}  rows       — live `plans` rows
+ * @param {string[]} activeKeys — admin_settings.platform_settings.active_plans
+ *   Step 1: keep only rows the Super Admin switched ON in `plans.is_active`.
+ *   Step 2: narrow further to the `active_plans` allow-list — but only when that
+ *   list still matches at least one live row. A list saved before a plan was
+ *   renamed/deleted is treated as stale and ignored, and if the allow-list
+ *   contradicts `plans.is_active` entirely we trust the live per-plan flag
+ *   rather than rendering an empty pricing page.
+ * @returns {Array} the rows to render
+ */
+export function selectEnabledPlans(rows, activeKeys = []) {
+  const data = Array.isArray(rows) ? rows : [];
+  const enabled = data.filter((p) => planIsActive(p));
+  const keys = (Array.isArray(activeKeys) ? activeKeys : []).filter((k) => typeof k === 'string' && k);
+  if (keys.length === 0) return enabled;
+
+  const matchesLive = keys.some((k) => data.some((p) => p.code === k || p.id === k));
+  if (!matchesLive) return enabled; // stale allow-list
+
+  const allow = new Set(keys);
+  const filtered = enabled.filter((p) => allow.has(p.code) || allow.has(p.id));
+  if (filtered.length === 0 && enabled.length > 0) {
+    console.warn('[billing] active_plans allow-list contradicts plans.is_active — using plans.is_active');
+    return enabled;
+  }
+  return filtered;
+}
+
 export default function BillingContent({
   shop = null,
   shopId = null,
@@ -208,7 +240,11 @@ export default function BillingContent({
             .eq('shop_id', shopId)
             .order('created_at', { ascending: false })
             .limit(50),
-        'id, shop_id, plan_id, billing_cycle, amount_rupees, invoice_number, payment_id, status, start_date, end_date, created_at',
+        /* `starts_at` / `ends_at` are the LIVE column names — the previous
+         * `start_date` / `end_date` names 400'd with 42703 on every load
+         * (PostgREST rejects the whole select), which was the console's
+         * "400 Bad Request" until selectStrict dropped to the safe list. */
+        'id, shop_id, plan_id, billing_cycle, amount_rupees, invoice_number, payment_id, status, starts_at, ends_at, created_at',
         'id, plan_id, billing_cycle, amount_rupees, invoice_number, status, created_at',
         'billing:invoices'
       );
@@ -281,14 +317,29 @@ export default function BillingContent({
     let cancelled = false;
     (async () => {
       try {
+        /* Step 1 — the Super Admin's allow-list: the `active_plans` array in
+         * the consolidated `admin_settings.platform_settings` row. */
+        const { value: platformSettings, error: settingsErr } = await loadPlatformSettings();
+        if (cancelled) return;
+        if (settingsErr) {
+          console.warn('[billing] active_plans load failed — filtering by plans.is_active only:', settingsErr?.message || settingsErr);
+        }
+        const activeKeys = Array.isArray(platformSettings?.active_plans)
+          ? platformSettings.active_plans.filter((k) => typeof k === 'string' && k)
+          : [];
+
+        /* Step 2 — live rows from `plans` (fetchPlans is column-tolerant). */
         const { data, error } = await fetchPlans();
         if (cancelled) return;
         if (error || !data || data.length === 0) return; // table may not exist yet
-        const active = data.filter((p) => planIsActive(p));
-        if (active.length > 0) {
-          console.log('Dynamic plans loaded:', active.length);
-          setDynamicPlans(active);
-        }
+
+        /* Steps 3 + 4 — enabled rows, narrowed by the allow-list (see
+         * selectEnabledPlans for the stale/contradictory-list rules). */
+        const filtered = selectEnabledPlans(data, activeKeys);
+
+        if (cancelled) return;
+        console.log(`Dynamic plans loaded: ${filtered.length}/${data.length} enabled`);
+        setDynamicPlans(filtered);
       } catch (plansErr) {
         console.warn('[billing] dynamic plans fetch failed — using static catalog:', plansErr?.message || plansErr);
       }
@@ -409,15 +460,16 @@ export default function BillingContent({
 
   const planStatusText = planStatus === 'suspended' ? 'Suspended' : 'Active';
 
-  /* Ordered plan list: DB rows first, static catalog as fallback structure */
+  /* Ordered plan list: when the DB answered we render EXACTLY the rows the
+   * Super Admin left enabled — the static catalog ids are never re-appended,
+   * which is what previously made deactivated plans keep showing up.
+   * `null` = the DB hasn't answered yet → static fallback. */
   const renderPlanIds = useMemo(() => {
-    const dbPlanIds = dynamicPlans && dynamicPlans.length > 0
-      ? dynamicPlans.map((p) => p.code).filter(Boolean)
-      : null;
-    if (!dbPlanIds) return PLAN_ORDER;
-    // Union keeps catalog order for known ids and appends admin-created ones.
-    const set = new Set(dbPlanIds.concat(PLAN_ORDER.filter((id) => !dbPlanIds.includes(id))));
-    return Array.from(set);
+    if (dynamicPlans == null) return PLAN_ORDER;
+    const dbPlanIds = dynamicPlans.map((p) => p.code).filter(Boolean);
+    const ordered = PLAN_ORDER.filter((id) => dbPlanIds.includes(id));
+    dbPlanIds.forEach((id) => { if (!ordered.includes(id)) ordered.push(id); });
+    return ordered;
   }, [dynamicPlans]);
 
   if (!planResolved) {
@@ -480,9 +532,18 @@ export default function BillingContent({
       </div>
 
       {/* ----------------------- Plan cards ------------------------ */}
-      {/* When DB plans are loaded use that ordered list so admin-created plans
-          appear automatically. Fall back to the hardcoded PLAN_ORDER constant
-          when the DB hasn't responded yet or the table is missing. */}
+      {/* When the DB has answered we render exactly the enabled rows. The
+          static PLAN_ORDER constant is only a fallback for when the DB hasn't
+          responded yet or the table is missing. */}
+      {renderPlanIds.length === 0 && (
+        <div className="rounded-2xl border border-[#1E2D4A] bg-[#1E293B] p-8 text-center">
+          <Inbox className="w-8 h-8 mx-auto mb-2 text-slate-600" />
+          <p className="text-sm font-semibold text-slate-300">No plans are currently available</p>
+          <p className="text-xs text-slate-500 mt-1">
+            No plan has been enabled for your account right now. Please contact support or check back later.
+          </p>
+        </div>
+      )}
       {renderPlanIds.map((planId, i) => (
         <PlanCard
           key={planId}
