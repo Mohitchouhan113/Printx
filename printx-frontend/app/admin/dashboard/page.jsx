@@ -1068,6 +1068,40 @@ function AuditModule() {
 /* ===================================================================== */
 /* MODULE 6 — Shop KYC & Admin Override                                   */
 /* ===================================================================== */
+/* ------------------------------------------------------------------ *//* Subscription-editor columns that may not exist yet on a deployment that
+ * hasn't run supabase/migrations/20261010_shops_subscription_columns.sql.
+ * Remembered for the session (and re-probed on every shop reload) so a
+ * second save doesn't re-learn it with more failed round trips.
+ * ------------------------------------------------------------------ */
+const PENDING_SUBSCRIPTION_COLUMNS = new Set();
+
+const SUBSCRIPTION_COLUMNS = [
+  ['subscription_plan', (f) => f.plan],
+  ['subscription_expires_at', (f) => (f.expires ? new Date(f.expires).toISOString() : null)],
+  ['payment_status', (f) => f.payment],
+  // SaaS state — drives the locked overlay on the vendor dashboard.
+  ['subscription_status', (f) => f.status || 'active'],
+  ['trial_ends_at', (f) => (f.trialEnds ? new Date(f.trialEnds).toISOString() : null)],
+  ['updated_at', () => new Date().toISOString()],
+];
+
+/**
+ * Turn the modal's form into the `shops` UPDATE payload, skipping columns the
+ * schema has already told us are absent. Pure so it can be tested directly.
+ *
+ * @param {{plan:string,expires:string,payment:string,status:string,trialEnds:string}} form
+ * @param {Set<string>} knownMissing
+ * @returns {Record<string, any>} columns to write
+ */
+export function buildSubscriptionPayload(form, knownMissing = PENDING_SUBSCRIPTION_COLUMNS) {
+  const payload = {};
+  for (const [col, read] of SUBSCRIPTION_COLUMNS) {
+    if (knownMissing.has(col)) continue;
+    payload[col] = read(form);
+  }
+  return payload;
+}
+
 function ShopKYCModule() {
   const [shops, setShops] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -1076,6 +1110,7 @@ function ShopKYCModule() {
   const [statusFilter, setStatusFilter] = useState('all');
   const [planFilter, setPlanFilter] = useState('all');
   const [editingSub, setEditingSub] = useState(null); // shop being edited
+  const [savingSub, setSavingSub] = useState(false); // guards double-submit
   const [subForm, setSubForm] = useState({ plan: 'free', expires: '', payment: 'unpaid', status: 'active', trialEnds: '' });
   const [showAddVendor, setShowAddVendor] = useState(false);
   const [creatingVendor, setCreatingVendor] = useState(false);
@@ -1102,6 +1137,14 @@ function ShopKYCModule() {
         if (error) throw error;
         console.log('Fetched Vendors Count:', (data || []).length);
         setShops(data || []);
+        // Re-probe the pending columns from the row we actually got back, so
+        // running the migration later re-enables those controls without a reload.
+        if ((data || []).length > 0) {
+          for (const col of ['subscription_status', 'trial_ends_at']) {
+            if (col in data[0]) PENDING_SUBSCRIPTION_COLUMNS.delete(col);
+            else PENDING_SUBSCRIPTION_COLUMNS.add(col);
+          }
+        }
       } else {
         setShops([
           { id: '1', name: 'Sharma Xerox', slug: 'sharma_xerox', phone: '9876543210', upi_id: 'sharma@upi', owner_id: 'u1', is_verified: true, is_active: true, is_approved: true, subscription_expires_at: '2026-12-31', subscription_plan: 'pro', payment_status: 'paid', total_orders: 342, total_revenue: 125000 },
@@ -1146,49 +1189,82 @@ function ShopKYCModule() {
   };
 
   const saveSubscription = async () => {
-    if (!editingSub) return;
-    const payload = {
-      subscription_plan: subForm.plan,
-      subscription_expires_at: subForm.expires ? new Date(subForm.expires).toISOString() : null,
-      payment_status: subForm.payment,
-      // SaaS state — drives the locked overlay on the vendor dashboard.
-      subscription_status: subForm.status || 'active',
-      trial_ends_at: subForm.trialEnds ? new Date(subForm.trialEnds).toISOString() : null,
-    };
-    setShops((prev) => prev.map((s) => s.id === editingSub.id ? { ...s, ...payload } : s));
-    if (isSupabaseConfigured && supabase) {
-      // Progressive column drop — subscription_status / trial_ends_at land
-      // once supabase/migrations/20260928_core_features.sql has been run.
-      let attempt = { ...payload };
-      const dropped = [];
-      let lastErr = null;
-      for (let i = 0; i < 5 && Object.keys(attempt).length > 0; i++) {
-        const { error } = await supabase.from('shops').update(attempt).eq('id', editingSub.id);
-        if (!error) { lastErr = null; break; }
-        lastErr = error;
-        const missing = (error.message || '').match(/'([\w]+)'\s+column|column\s+"(\w+)"/);
-        const col = missing?.[1] || missing?.[2];
-        if ((error.code === 'PGRST204' || error.code === '42703') && col && attempt[col] !== undefined) {
-          dropped.push(col);
-          delete attempt[col];
-          continue;
-        }
+    if (!editingSub || savingSub) return;
+
+    const payload = buildSubscriptionPayload(subForm);
+    if (Object.keys(payload).length === 0) {
+      notify('error', 'Nothing to save — run 20261010_shops_subscription_columns.sql in the Supabase SQL Editor to enable these controls.');
+      return;
+    }
+
+    setSavingSub(true);
+    const name = editingSub.name;
+    // Optimistic — rolled back below if the write cannot be proven.
+    const before = shops.find((s) => s.id === editingSub.id) || editingSub;
+    setShops((prev) => prev.map((s) => (s.id === editingSub.id ? { ...s, ...payload } : s)));
+
+    if (!isSupabaseConfigured || !supabase) {
+      setSavingSub(false);
+      setEditingSub(null);
+      notify('success', `Subscription updated for ${name} (demo mode).`);
+      return;
+    }
+
+    // Progressive column drop — subscription_status / trial_ends_at /
+    // updated_at land once 20261010_shops_subscription_columns.sql has run.
+    let attempt = { ...payload };
+    const dropped = [];
+    let savedRow = null;
+    let lastErr = null;
+    for (let i = 0; i < 6 && Object.keys(attempt).length > 0; i++) {
+      // `.select('*')` is what makes the write PROVABLE: without it PostgREST
+      // answers 204 even when RLS filtered every row out, which is exactly how
+      // a rejected save used to show a success toast and revert on refresh.
+      const { data, error } = await supabase
+        .from('shops')
+        .update(attempt)
+        .eq('id', editingSub.id)
+        .select('*');
+      if (!error) {
+        savedRow = Array.isArray(data) ? data[0] || null : data;
+        lastErr = null;
         break;
       }
-      if (lastErr) console.error('[admin] subscription save failed:', lastErr);
-      if (dropped.length > 0) {
-        setToast({
-          type: 'success',
-          msg: `Subscription saved without: ${dropped.join(', ')} — run 20260928_core_features.sql to enable them.`,
-        });
-        setTimeout(() => setToast(null), 5000);
-        setEditingSub(null);
-        return;
+      lastErr = error;
+      const missing = (error.message || '').match(/'([\w]+)'\s+column|column\s+"(\w+)"/);
+      const col = missing?.[1] || missing?.[2];
+      if ((error.code === 'PGRST204' || error.code === '42703') && col && attempt[col] !== undefined) {
+        dropped.push(col);
+        PENDING_SUBSCRIPTION_COLUMNS.add(col);
+        delete attempt[col];
+        continue;
       }
+      break;
     }
+
+    // ---- Failure: prove it, roll the optimistic state back, keep the modal open ----
+    if (lastErr || !savedRow) {
+      console.error('[admin] subscription save failed:', lastErr || 'no row was updated');
+      setShops((prev) => prev.map((s) => (s.id === editingSub.id ? before : s)));
+      setSavingSub(false);
+      notify('error', `Subscription NOT saved: ${lastErr?.message || 'no row was updated'}`);
+      return;
+    }
+
+    // ---- Success: replace optimistic state with the row the DB returned ----
+    // (this also reverts any column that could not be written, so the card
+    //  never shows a value the database does not hold)
+    setShops((prev) => prev.map((s) => (s.id === editingSub.id ? { ...s, ...savedRow } : s)));
+    setSavingSub(false);
     setEditingSub(null);
-    setToast({ type: 'success', msg: `Subscription plan updated for ${editingSub.name}!` });
-    setTimeout(() => setToast(null), 3500);
+    if (dropped.length > 0) {
+      notify(
+        'error',
+        `Saved ${Object.keys(attempt).join(', ')} — but ${dropped.join(', ')} could not be written: column(s) missing. Run supabase/migrations/20261010_shops_subscription_columns.sql.`
+      );
+    } else {
+      notify('success', `Subscription updated for ${name}!`);
+    }
   };
 
   /**
@@ -1566,7 +1642,7 @@ function ShopKYCModule() {
               {/* Footer */}
               <div className="flex items-center justify-end gap-2 px-5 py-4 border-t border-[#1E2D4A]">
                 <button onClick={() => setEditingSub(null)} className="px-4 py-2 rounded-xl text-xs text-slate-400 hover:text-white transition-colors">Cancel</button>
-                <motion.button whileHover={{ scale: 1.02 }} whileTap={{ scale: 0.97 }} onClick={saveSubscription} className="px-5 py-2 rounded-xl bg-gradient-to-r from-cyan-500 to-indigo-600 text-white text-xs font-bold shadow-lg shadow-cyan-500/20">Save Subscription</motion.button>
+                <motion.button whileHover={{ scale: 1.02 }} whileTap={{ scale: 0.97 }} onClick={saveSubscription} disabled={savingSub} className="inline-flex items-center gap-1.5 px-5 py-2 rounded-xl bg-gradient-to-r from-cyan-500 to-indigo-600 text-white text-xs font-bold shadow-lg shadow-cyan-500/20 disabled:opacity-50">{savingSub && <Loader2 className="w-3.5 h-3.5 animate-spin" />}{savingSub ? 'Saving…' : 'Save Subscription'}</motion.button>
               </div>
             </motion.div>
           </motion.div>
