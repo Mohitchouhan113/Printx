@@ -35,7 +35,11 @@ import {
   Trash2,
   Ticket,
 } from 'lucide-react';
-import { DEFAULT_VOLUME_RATES, DEFAULT_PAPER_SIZES, normalizePricingTiers } from '../../lib/pricing';
+import { DEFAULT_VOLUME_RATES, DEFAULT_PAPER_SIZES, normalizePricingTiers, DEMO_COUPONS } from '../../lib/pricing';
+
+const DEFAULT_COUPONS = [
+  { id: 1, code: 'EXAM10', discount_type: 'percentage', discount_value: 10, active: true },
+];
 import { QRCodeSVG } from 'qrcode.react';
 import { supabase, isSupabaseConfigured } from '../../lib/supabaseClient';
 import { selectStrict } from '../../lib/supabaseSelect';
@@ -1152,13 +1156,62 @@ function inputCls(valid) {
 /* ------------------------------------------------------------------ */
 function BulkPricingCouponsSection({ shopSlug }) {
   const [tiers, setTiers] = useState(DEFAULT_VOLUME_RATES);
-  const [coupons, setCoupons] = useState([
-    { id: 1, code: 'EXAM10', discount_type: 'percentage', discount_value: 10, active: true },
-  ]);
+  const [coupons, setCoupons] = useState(null);
   const [newCoupon, setNewCoupon] = useState({ code: '', discount_type: 'percentage', discount_value: 10 });
   const [tiersSaved, setTiersSaved] = useState(false);
   const [tiersError, setTiersError] = useState('');
   const [couponError, setCouponError] = useState('');
+
+  // Load promo codes from promo_codes table on mount (Issue 1 fix).
+  // Falls back to a local default only when Supabase isn't configured or the
+  // table is empty — never overwrites real DB rows with hardcoded values.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!isSupabaseConfigured || !supabase || !shopSlug) {
+        if (!cancelled) setCoupons(DEFAULT_COUPONS);
+        return;
+      }
+      try {
+        // Resolve shop_id from slug first (promo_codes stores shop_id, not slug).
+        const { data: shopRow } = await supabase
+          .from('shops')
+          .select('id')
+          .eq('slug', shopSlug)
+          .maybeSingle();
+        if (!cancelled || !shopRow?.id) {
+          if (!shopRow?.id) {
+            // Shop not found by slug — keep the default local coupons.
+            setCoupons(DEFAULT_COUPONS);
+          }
+          return;
+        }
+        const { data: codes, error: codesErr } = await supabase
+          .from('promo_codes')
+          .select('id, code, discount_type, discount_value, is_active')
+          .eq('shop_id', shopRow.id)
+          .order('created_at', { ascending: false });
+        if (!cancelled) {
+          if (!codesErr && Array.isArray(codes) && codes.length > 0) {
+            setCoupons(codes.map((c) => ({
+              id: c.id,
+              code: c.code,
+              discount_type: c.discount_type || 'percentage',
+              discount_value: Number(c.discount_value) || 0,
+              active: c.is_active !== false,
+            })));
+          } else {
+            // Table empty / query failed — use a safe local default so the UI
+            // still renders a sample code (EXAM10) without blocking the page.
+            setCoupons(DEFAULT_COUPONS);
+          }
+        }
+      } catch (err) {
+        if (!cancelled) setCoupons(DEFAULT_COUPONS);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [shopSlug]);
 
   /* ---- Tiered bulk discount — shops.pricing_tiers (bounded ₹/page ranges) ----
    * Spec example: 1-20 pages = ₹2/page, 21-50 = ₹1.8/page, 51+ = ₹1.5/page.
@@ -1330,16 +1383,23 @@ function BulkPricingCouponsSection({ shopSlug }) {
 
   const saveCouponsNow = async (latestCoupons) => {
     if (!isSupabaseConfigured || !supabase || !shopSlug) return;
+    // 1. Update shops JSONB `coupons` column (existing behaviour) — guarded
+    //    by progressive column-drop so a missing column never blocks the save.
     const data = latestCoupons ?? coupons;
     const body = {};
     if (Array.isArray(data) && data.length) body.coupons = data;
-    if (!Object.keys(body).length) return;
+    if (!Object.keys(body).length) {
+      // Still sync the promo_codes table even when the JSONB body is empty
+      // (e.g. all codes deleted) so the DB doesn't drift from the UI.
+      await syncPromoCodesTable([]);
+      return;
+    }
     try {
       let attempt = { ...body };
       let res;
       for (let i = 0; i < 3 && Object.keys(attempt).length; i++) {
         res = await supabase.from('shops').update(attempt).eq('slug', shopSlug).select('slug').single();
-        if (!res.error) return;
+        if (!res.error) break;
         const missing = (res.error.message || '').match(/'?(\w+)'? column/)?.[1];
         if (!missing || !(missing in attempt)) break;
         console.warn(`[settings] shops schema missing column "${missing}" — dropping it`);
@@ -1349,7 +1409,73 @@ function BulkPricingCouponsSection({ shopSlug }) {
     } catch (err) {
       console.error('[settings] saveCouponsNow threw:', err?.message || err);
     }
+    // 2. Sync promo_codes table in parallel so the customer checkout can
+    //    query it directly (Issue 2 / Issue 3). Always attempted even if the
+    //    shops JSONB write failed — the two stores are independent.
+    await syncPromoCodesTable(data);
   };
+
+  /**
+   * Sync the `promo_codes` table to match the current in-memory coupon list.
+   * Uses upsert keyed on (shop_id, code) so create/toggle/delete all land
+   * correctly without a separate delete-then-insert dance.
+   */
+  const syncPromoCodesTable = async (codes) => {
+    if (!isSupabaseConfigured || !supabase || !shopSlug) return;
+    try {
+      const { data: shopRow } = await supabase
+        .from('shops')
+        .select('id')
+        .eq('slug', shopSlug)
+        .maybeSingle();
+      if (!shopRow?.id) return;
+      const shopId = shopRow.id;
+      // Delete codes that are no longer in the list, then upsert the rest.
+      // Build the list of codes to keep so we only delete stale rows.
+      const keptCodes = (codes || []).map((c) => String(c.code).toUpperCase());
+      if (keptCodes.length === 0) {
+        // All codes removed — wipe the table rows for this shop.
+        await supabase.from('promo_codes').delete().eq('shop_id', shopId);
+      } else {
+        // Delete rows whose code is not in the kept set.
+        const { data: existingCodes } = await supabase
+          .from('promo_codes')
+          .select('id, code')
+          .eq('shop_id', shopId);
+        if (existingCodes && Array.isArray(existingCodes)) {
+          const toDelete = existingCodes.filter((row) => !keptCodes.includes(String(row.code).toUpperCase()));
+          for (const row of toDelete) {
+            await supabase.from('promo_codes').delete().eq('id', row.id).eq('shop_id', shopId);
+          }
+        }
+      }
+      for (const c of codes) {
+        const code = String(c.code).toUpperCase();
+        const discountType = c.discount_type || 'percentage';
+        const discountValue = Number(c.discount_value) || 0;
+        const isActive = c.active !== false;
+        const { error: upsertErr } = await supabase
+          .from('promo_codes')
+          .upsert(
+            {
+              shop_id: shopId,
+              code,
+              discount_type: discountType,
+              discount_value: discountValue,
+              is_active: isActive,
+            },
+            { onConflict: 'shop_id,code' }
+          );
+        if (upsertErr) {
+          console.error('[settings] promo_codes upsert failed for', code, ':', upsertErr.message);
+        }
+      }
+    } catch (err) {
+      console.error('[settings] syncPromoCodesTable threw:', err?.message || err);
+    }
+  };
+
+  const couponsList = coupons || [];
 
   const addCoupon = () => {
     setCouponError('');
@@ -1358,7 +1484,7 @@ function BulkPricingCouponsSection({ shopSlug }) {
       setCouponError('Code must be 3–15 uppercase letters/numbers');
       return;
     }
-    if (coupons.some((c) => c.code === code)) {
+    if (couponsList.some((c) => c.code === code)) {
       setCouponError('This code already exists');
       return;
     }
@@ -1367,7 +1493,7 @@ function BulkPricingCouponsSection({ shopSlug }) {
       return;
     }
     const updated = [
-      ...coupons,
+      ...couponsList,
       { id: Date.now(), code, discount_type: newCoupon.discount_type, discount_value: Number(newCoupon.discount_value), active: true },
     ];
     setCoupons(updated);
@@ -1376,14 +1502,14 @@ function BulkPricingCouponsSection({ shopSlug }) {
   };
 
   const deleteCoupon = (id) => {
-    const updated = coupons.filter((c) => c.id !== id);
+    const updated = couponsList.filter((c) => c.id !== id);
     setCoupons(updated);
     touchedCoupons.current = true;
     saveCouponsNow(updated);
   };
 
   const toggleCoupon = (id) => {
-    const updated = coupons.map((c) => (c.id === id ? { ...c, active: !c.active } : c));
+    const updated = couponsList.map((c) => (c.id === id ? { ...c, active: !c.active } : c));
     setCoupons(updated);
     touchedCoupons.current = true;
     saveCouponsNow(updated);
@@ -1628,7 +1754,7 @@ function BulkPricingCouponsSection({ shopSlug }) {
 
         {/* Coupon list */}
         <div className="space-y-2">
-          {coupons.map((c) => (
+          {couponsList.map((c) => (
             <div
               key={c.id}
               className="flex items-center gap-3 px-3 py-2.5 rounded-xl bg-[#1E293B] border border-[#1E2D4A]/60"
@@ -1673,7 +1799,7 @@ function BulkPricingCouponsSection({ shopSlug }) {
               </motion.button>
             </div>
           ))}
-          {coupons.length === 0 && (
+          {couponsList.length === 0 && (
             <p className="text-[11px] text-slate-600 text-center py-3">No promo codes yet</p>
           )}
         </div>

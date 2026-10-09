@@ -556,6 +556,17 @@ export default function ShopUploadPage({ params }) {
     };
   }, [rawPages, shop.volumeRates, shop.pricingTiers, coupon, bindingType, paperRates, shopBindingOptions, enableBinding, isPriority]);
 
+  /**
+   * Clear the applied coupon + input whenever the file list changes or a new
+   * order is started, so a coupon from a previous selection can never bleed
+   * into a different order.
+   */
+  const resetAppliedCoupon = () => {
+    setCoupon(null);
+    setCouponInput('');
+    setCouponStatus(null);
+  };
+
   /* ---------- Coupon apply ---------- */
   const applyCoupon = async () => {
     const code = couponInput.trim().toUpperCase();
@@ -563,18 +574,45 @@ export default function ShopUploadPage({ params }) {
     setCouponChecking(true);
     setCouponStatus(null);
     try {
-      const res = await fetch('/api/coupons/validate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ code, shopSlug: slug }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (res.ok && data.success) {
-        setCoupon(data.coupon);
-        setCouponStatus({ type: 'success', message: `${data.coupon.code} applied!` });
+      // Prefer the live promo_codes table when Supabase is configured;
+      // fall back to the offline DEMO_COUPONS catalog otherwise so the UX is
+      // identical in demo mode.
+      if (isSupabaseConfigured && supabase && shop.id) {
+        const { data: promoRow, error: promoErr } = await supabase
+          .from('promo_codes')
+          .select('id, code, discount_type, discount_value, is_active')
+          .eq('shop_id', shop.id)
+          .eq('code', code)
+          .eq('is_active', true)
+          .maybeSingle();
+
+        if (promoErr || !promoRow) {
+          setCoupon(null);
+          setCouponStatus({
+            type: 'error',
+            message: promoErr
+              ? 'Could not verify coupon — try again'
+              : 'Invalid or expired promo code',
+          });
+          return;
+        }
+
+        setCoupon({
+          code: promoRow.code,
+          discount_type: promoRow.discount_type || 'percentage',
+          discount_value: Number(promoRow.discount_value) || 0,
+        });
+        setCouponStatus({ type: 'success', message: `${promoRow.code} applied!` });
       } else {
-        setCoupon(null);
-        setCouponStatus({ type: 'error', message: data.error || 'Invalid coupon' });
+        // Demo mode — validate against the offline coupon catalog.
+        const demo = DEMO_COUPONS[code];
+        if (demo && demo.active) {
+          setCoupon(demo);
+          setCouponStatus({ type: 'success', message: `${demo.code} applied!` });
+        } else {
+          setCoupon(null);
+          setCouponStatus({ type: 'error', message: 'Invalid or expired promo code' });
+        }
       }
     } catch {
       setCouponStatus({ type: 'error', message: 'Could not verify coupon — try again' });
@@ -707,6 +745,9 @@ export default function ShopUploadPage({ params }) {
       const accepted = newItems.slice(0, Math.max(0, room));
       if (accepted.length > 0) {
         setFilesList((prev) => [...prev, ...accepted]);
+        // A new file selection invalidates any coupon applied to the previous
+        // selection — clear it so the discount always matches the current order.
+        resetAppliedCoupon();
         // Fire the Smart AI pixel scan + background compression for each
         // accepted PDF (non-blocking — billing shows the estimate until real
         // page colors land; compression swaps in via `uploadFile` when done).
@@ -736,12 +777,17 @@ export default function ShopUploadPage({ params }) {
 
   const removeFile = (id) => {
     setFilesList((prev) => prev.filter((f) => f.id !== id));
+    // Removing a file changes the order — reset any applied coupon.
+    resetAppliedCoupon();
   };
 
   const updateFileConfig = (id, patch) => {
     setFilesList((prev) =>
       prev.map((f) => (f.id === id ? { ...f, config: { ...f.config, ...patch } } : f))
     );
+    // Changing print specs (copies, sides, color mode) changes the order's
+    // pricing basis — clear any coupon so it's recomputed for the new spec.
+    resetAppliedCoupon();
   };
 
   /* ================================================================ */
@@ -780,6 +826,9 @@ export default function ShopUploadPage({ params }) {
     setFileError(null);
     setStep('form');
     window.scrollTo({ top: 0, behavior: 'smooth' });
+    // A reprint rebuilds the order from scratch — clear any coupon from the
+    // previous order so the discount is recomputed for the new selection.
+    resetAppliedCoupon();
   };
 
   /* ---------- Validation & gating ---------- */
@@ -2432,7 +2481,7 @@ export default function ShopUploadPage({ params }) {
                       type="button"
                       whileHover={{ scale: 1.02 }}
                       whileTap={{ scale: 0.97 }}
-                      onClick={() => setPaperSize(p.id)}
+                      onClick={() => { setPaperSize(p.id); resetAppliedCoupon(); }}
                       aria-pressed={active}
                       title={p.name}
                       className={`rounded-full border px-4 py-2 text-left transition-colors ${
@@ -2468,7 +2517,7 @@ export default function ShopUploadPage({ params }) {
                   type="button"
                   role="switch"
                   aria-checked={printSpecific}
-                  onClick={() => setPrintSpecific((v) => !v)}
+                  onClick={() => { setPrintSpecific((v) => !v); resetAppliedCoupon(); }}
                   className={`relative w-11 h-6 rounded-full transition-colors flex-shrink-0 ${
                     printSpecific ? 'bg-cyan-500' : 'bg-slate-600'
                   }`}
@@ -2499,7 +2548,7 @@ export default function ShopUploadPage({ params }) {
                         id="print-page-range"
                         type="text"
                         value={pageRangeInput}
-                        onChange={(e) => setPageRangeInput(e.target.value)}
+                        onChange={(e) => { setPageRangeInput(e.target.value); resetAppliedCoupon(); }}
                         placeholder="e.g. 1-5, 10, 15-20"
                         aria-label="Print Page Range"
                         className={`w-full rounded-xl bg-[#0B132B] border px-3.5 py-2.5 text-sm text-white placeholder-slate-600 focus:outline-none focus:border-cyan-500/60 ${
@@ -2614,7 +2663,7 @@ export default function ShopUploadPage({ params }) {
                       type="button"
                       whileHover={{ scale: 1.02 }}
                       whileTap={{ scale: 0.97 }}
-                      onClick={() => setBindingType(opt.id)}
+                      onClick={() => { setBindingType(opt.id); resetAppliedCoupon(); }}
                       aria-pressed={active}
                       className={`relative rounded-xl border px-3 py-2.5 text-left transition-colors overflow-hidden ${
                         active
@@ -2654,7 +2703,7 @@ export default function ShopUploadPage({ params }) {
           {filesList.length > 0 && (
             <motion.button
               type="button"
-              onClick={() => setIsPriority((v) => !v)}
+              onClick={() => { setIsPriority((v) => !v); resetAppliedCoupon(); }}
               aria-pressed={isPriority}
               initial={{ opacity: 0, y: 10 }}
               animate={{ opacity: 1, y: 0 }}

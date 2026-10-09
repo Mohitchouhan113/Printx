@@ -96,7 +96,7 @@ check('saveTiers-writes-to-shops', () => {
 check('addCoupon-calls-saveCouponsNow', () => {
   const b = findBlock(S, 'const addCoupon = () => {');
   const body = (b && b.ok) ? b.body : '';
-  return b && b.ok && body.includes('saveCouponsNow()');
+  return b && b.ok && (body.includes('saveCouponsNow()') || body.includes('saveCouponsNow(updated)'));
 });
 
 check('deleteCoupon-calls-saveCouponsNow', () => {
@@ -107,7 +107,7 @@ check('deleteCoupon-calls-saveCouponsNow', () => {
   if (start < 0) return false;
   const b = findBlock(S.slice(start), 'const deleteCoupon');
   const body = (b && b.ok) ? b.body : '';
-  return b && b.ok && body.includes('saveCouponsNow()');
+  return b && b.ok && (body.includes('saveCouponsNow()') || body.includes('saveCouponsNow(updated)'));
 });
 
 check('toggleCoupon-calls-saveCouponsNow', () => {
@@ -117,7 +117,7 @@ check('toggleCoupon-calls-saveCouponsNow', () => {
   if (start < 0) return false;
   const b = findBlock(S.slice(start), 'const toggleCoupon');
   const body = (b && b.ok) ? b.body : '';
-  return b && b.ok && body.includes('saveCouponsNow()');
+  return b && b.ok && (body.includes('saveCouponsNow()') || body.includes('saveCouponsNow(updated)'));
 });
 
 check('promo_codes-initial-load-effect', () => {
@@ -125,7 +125,7 @@ check('promo_codes-initial-load-effect', () => {
 });
 
 check('saveCouponsNow-defined-and-writes-to-shops', () => {
-  const b = findBlock(S, 'const saveCouponsNow = async () => {');
+  const b = findBlock(S, 'const saveCouponsNow = async (latestCoupons) => {');
   const body = (b && b.ok) ? b.body : S;
   const defined = b && b.ok;
   const writesToShops = body.includes("supabase.from('shops').update") || body.includes("supabase.from(\"shops\").update") || body.includes("supabase.from('shops').upsert") || body.includes("supabase.from(\"shops\").upsert");
@@ -155,11 +155,11 @@ check('handleToggleStaffSession-saves', () => {
   if (start < 0) return false;
   const b = findBlock(S.slice(start), 'const handleToggleStaffSession');
   const body = (b && b.ok) ? b.body : '';
-  return b && b.ok && body.includes('saveStaffSessionsNow()');
+  return b && b.ok && (body.includes('saveStaffSessionsNow()') || body.includes('saveStaffSessionsNow(updated)'));
 });
 
 check('saveStaffSessionsNow-writes-to-shops', () => {
-  const b = findBlock(S, 'const saveStaffSessionsNow = async () => {');
+  const b = findBlock(S, 'const saveStaffSessionsNow = async (latestStaff) => {');
   const body = (b && b.ok) ? b.body : '';
   const writesToShops = body.includes("supabase.from('shops').update") || body.includes("supabase.from(\"shops\").update") || body.includes("supabase.from('shops').upsert") || body.includes("supabase.from(\"shops\").upsert");
   const hasStaffSessions = body.includes('staff_sessions');
