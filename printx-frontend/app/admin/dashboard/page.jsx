@@ -72,7 +72,8 @@ import {
 } from '../../../lib/plansStore';
 import {
   loadAdminSettings,
-  upsertAdminSetting,
+  loadPlatformSettings,
+  savePlatformSettings,
   SETTINGS_KEYS,
   DEFAULT_OFFER,
 } from '../../../lib/adminSettings';
@@ -1641,21 +1642,52 @@ function PlatformSettingsModule() {
     setTimeout(() => setToast(null), 4500);
   };
 
-  /* ---- Mount: fetch settings, offers and plans straight from Supabase ---- */
+  /* ---- Mount: fetch the saved settings and hydrate every field ---------- */
   const loadAll = useCallback(async () => {
     setLoading(true);
     try {
-      const { values, table } = await loadAdminSettings();
-      setSourceTable(table || '');
+      // The consolidated `admin_settings.platform_settings` row is the source
+      // of truth. The split keys are read only as a back-compat fallback for
+      // values saved before the consolidation.
+      const [platformRes, legacyRes] = await Promise.all([
+        loadPlatformSettings(),
+        loadAdminSettings([SETTINGS_KEYS.phone, SETTINGS_KEYS.offers, SETTINGS_KEYS.plans]),
+      ]);
+      const val = platformRes.value || null;
+      setSourceTable(platformRes.table || legacyRes.table || '');
 
-      const savedPhone = values[SETTINGS_KEYS.phone];
-      const savedOffer = values[SETTINGS_KEYS.offers];
-      const savedPlans = values[SETTINGS_KEYS.plans];
+      const savedPhone = legacyRes.values[SETTINGS_KEYS.phone];
+      const savedOffer = legacyRes.values[SETTINGS_KEYS.offers];
+      const savedPlans = legacyRes.values[SETTINGS_KEYS.plans];
 
-      setPhone(savedPhone?.phone || '');
+      // Hydrate from what was actually saved. The hardcoded defaults only
+      // stand in on a genuinely fresh install (no saved row at all) — a
+      // failed/empty fetch never silently replaces saved values.
+      if (val) {
+        setPhone(typeof val.phone === 'string' ? val.phone : '');
+        setOffer({
+          ...DEFAULT_OFFER,
+          headline: val.offer_headline ?? '',
+          code: val.offer_code ?? '',
+          note: val.offer_fine_print ?? '',
+          enabled: typeof val.offer_enabled === 'boolean' ? val.offer_enabled : false,
+        });
+      } else {
+        setPhone(savedPhone?.phone || '');
+        setOffer({
+          ...DEFAULT_OFFER,
+          headline: savedOffer?.headline || '',
+          code: savedOffer?.code || '',
+          note: savedOffer?.note || '',
+          enabled: Boolean(savedOffer?.enabled),
+        });
+      }
       setPhoneDirty(false);
-      setOffer({ ...DEFAULT_OFFER, ...(savedOffer || {}) });
       setOfferDirty(false);
+
+      if (platformRes.error || legacyRes.error) {
+        notify('error', 'Could not load saved settings — values shown may be stale.');
+      }
 
       if (isSupabaseConfigured && supabase) {
         const { data, error } = await fetchPlans();
@@ -1691,11 +1723,33 @@ function PlatformSettingsModule() {
 
   useEffect(() => { loadAll(); }, [loadAll]);
 
+  /**
+   * Consolidated snapshot of every Platform Settings field. Persisted as ONE
+   * row — `admin_settings.platform_settings` — so a refresh restores exactly
+   * what was saved instead of the hardcoded defaults.
+   */
+  const platformSnapshot = () => ({
+    phone: phone.trim(),
+    offer_headline: (offer.headline || '').trim(),
+    offer_code: (offer.code || '').trim().toUpperCase(),
+    offer_fine_print: (offer.note || '').trim(),
+    offer_enabled: Boolean(offer.enabled),
+    active_plans: Object.keys(enabledMap).filter((code) => enabledMap[code] !== false),
+  });
+
+  /**
+   * Upsert the consolidated `platform_settings` row, merging the current
+   * in-memory state with any override — so a partial save (e.g. only phone)
+   * never clobbers the other fields.
+   */
+  const persistPlatformSettings = async (override = {}) =>
+    savePlatformSettings({ ...platformSnapshot(), ...override });
+
   /* ------------------------------- Phone ------------------------------- */
   const savePhone = async () => {
     if (saving) return;
     setSaving('phone');
-    const res = await upsertAdminSetting(SETTINGS_KEYS.phone, { phone: phone.trim() });
+    const res = await persistPlatformSettings({ phone: phone.trim() });
     setSaving(null);
     if (!res.ok) {
       notify('error', `Could not save phone number: ${res.error?.message || 'upsert failed'}`);
@@ -1715,7 +1769,12 @@ function PlatformSettingsModule() {
       code: (offer.code || '').trim().toUpperCase(),
       note: (offer.note || '').trim(),
     };
-    const res = await upsertAdminSetting(SETTINGS_KEYS.offers, payload);
+    const res = await persistPlatformSettings({
+      offer_enabled: payload.enabled,
+      offer_headline: payload.headline,
+      offer_code: payload.code,
+      offer_fine_print: payload.note,
+    });
     setSaving(null);
     if (!res.ok) {
       notify('error', `Could not save offer: ${res.error?.message || 'upsert failed'}`);
@@ -1744,9 +1803,9 @@ function PlatformSettingsModule() {
       if (!res.ok) failed.push(p.code);
     }
 
-    // 2. Explicit upsert of the plan flags into admin_settings.
+    // 2. Upsert the plan flags into the consolidated admin_settings row.
     const enabled = Object.keys(enabledMap).filter((code) => enabledMap[code] !== false);
-    const mirror = await upsertAdminSetting(SETTINGS_KEYS.plans, { enabled, updated_at: new Date().toISOString() });
+    const mirror = await persistPlatformSettings({ active_plans: enabled });
     setSaving(null);
 
     if (failed.length > 0) {
@@ -1908,7 +1967,7 @@ function PlatformSettingsModule() {
         </div>
         <p className="text-[11px] text-slate-500 mb-4">
           Which plans customers can buy. Saved to <code className="text-cyan-500/80">plans.is_active</code> and mirrored into{' '}
-          <code className="text-cyan-500/80">admin_settings.platform_plans</code>.
+          <code className="text-cyan-500/80">admin_settings.platform_settings</code>.
         </p>
         {plans.length === 0 ? (
           <div className="text-xs text-slate-500 py-3">No plans found in the database.</div>

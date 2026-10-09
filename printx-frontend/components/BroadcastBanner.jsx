@@ -4,7 +4,7 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Megaphone, Info, AlertTriangle, Cpu, X, Tag, PhoneCall } from 'lucide-react';
 import { supabase, isSupabaseConfigured } from '../lib/supabaseClient';
-import { loadAdminSettings, SETTINGS_KEYS } from '../lib/adminSettings';
+import { loadAdminSettings, loadPlatformSettings, SETTINGS_KEYS } from '../lib/adminSettings';
 
 /**
  * BroadcastBanner — the Super Admin's global announcement strip.
@@ -53,7 +53,7 @@ export default function BroadcastBanner({ variant = 'student', className = '' })
   const load = useCallback(async () => {
     if (!isSupabaseConfigured || !supabase) return;
     try {
-      const [annRes, settingsRes] = await Promise.all([
+      const [annRes, settingsRes, platformRes] = await Promise.all([
         supabase
           .from('announcements')
           .select('id, title, message, type, is_active, created_at')
@@ -61,8 +61,25 @@ export default function BroadcastBanner({ variant = 'student', className = '' })
           .order('created_at', { ascending: false })
           .limit(3),
         loadAdminSettings([SETTINGS_KEYS.phone, SETTINGS_KEYS.offers]),
+        loadPlatformSettings(),
       ]);
-      setSettings(settingsRes.values || {});
+      // The Super Admin settings panel now writes ONE consolidated row
+      // (`admin_settings.platform_settings`). Prefer it; fall back to the
+      // split keys only when that row has never been written.
+      const platform = platformRes.value;
+      setSettings(
+        platform
+          ? {
+              [SETTINGS_KEYS.offers]: {
+                enabled: platform.offer_enabled,
+                headline: platform.offer_headline,
+                code: platform.offer_code,
+                note: platform.offer_fine_print,
+              },
+              [SETTINGS_KEYS.phone]: platform.phone,
+            }
+          : settingsRes.values || {}
+      );
 
       const { data, error } = annRes;
       if (error) {
