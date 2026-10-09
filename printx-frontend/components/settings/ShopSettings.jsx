@@ -1449,25 +1449,29 @@ function BulkPricingCouponsSection({ shopSlug }) {
           }
         }
       }
-      for (const c of codes) {
+      const upsertPayload = codes.map((c) => {
         const code = String(c.code).toUpperCase();
         const discountType = c.discount_type || 'percentage';
         const discountValue = Number(c.discount_value) || 0;
         const isActive = c.active !== false;
-        const { error: upsertErr } = await supabase
+        return {
+          shop_id: shopId,
+          code,
+          discount_type: discountType,
+          discount_value: discountValue,
+          is_active: isActive,
+        };
+      });
+      if (upsertPayload.length > 0) {
+        const { error: bulkUpsertErr } = await supabase
           .from('promo_codes')
-          .upsert(
-            {
-              shop_id: shopId,
-              code,
-              discount_type: discountType,
-              discount_value: discountValue,
-              is_active: isActive,
-            },
-            { onConflict: 'shop_id,code' }
-          );
-        if (upsertErr) {
-          console.error('[settings] promo_codes upsert failed for', code, ':', upsertErr.message);
+          .upsert(upsertPayload, { onConflict: 'shop_id,code' });
+        if (bulkUpsertErr) {
+          if (bulkUpsertErr.code === '23505' || bulkUpsertErr.status === 409) {
+            console.warn('[settings] promo_codes bulk upsert hit a unique conflict for shop', shopId);
+          } else {
+            console.error('[settings] promo_codes bulk upsert failed:', bulkUpsertErr?.message || bulkUpsertErr);
+          }
         }
       }
     } catch (err) {
@@ -1564,24 +1568,33 @@ function BulkPricingCouponsSection({ shopSlug }) {
         if (shopRow?.id) {
           const { data: created, error: createErr } = await supabase
             .from('promo_codes')
-            .insert({
-              shop_id: shopRow.id,
-              code: payload.code,
-              discount_type: payload.discount_type,
-              discount_value: payload.discount_value,
-              is_active: payload.is_active,
-            })
+            .upsert(
+              {
+                shop_id: shopRow.id,
+                code: payload.code,
+                discount_type: payload.discount_type,
+                discount_value: payload.discount_value,
+                is_active: payload.is_active,
+              },
+              { onConflict: 'shop_id,code' }
+            )
             .select()
             .single();
-          if (!createErr && created) {
+          if (createErr) {
+            if (createErr.code === '23505' || createErr.status === 409) {
+              setCouponError('This promo code already exists.');
+            } else {
+              console.error('[settings] promo_codes upsert failed:', createErr?.message || createErr);
+              setCouponError(createErr?.message || 'Could not create promo code');
+            }
+          } else if (created) {
             // Replace the optimistic local entry with the real DB row so IDs stay in sync.
             const finalList = updated.map((c) =>
               c.id === localId ? { ...c, id: created.id } : c
             );
             setCoupons(finalList);
           } else {
-            console.error('[settings] promo_codes insert failed:', createErr?.message || createErr);
-            setCouponError(createErr?.message || 'Could not create promo code');
+            setCouponError('Could not create promo code');
           }
         } else {
           setCouponError('Shop not found by slug');
@@ -1604,12 +1617,26 @@ function BulkPricingCouponsSection({ shopSlug }) {
       try {
         const { data: shopRow } = await supabase.from('shops').select('id').eq('slug', shopSlug).maybeSingle();
         if (shopRow?.id) {
-          const { error: toggleErr } = await supabase
+          const { data: toggled, error: toggleErr } = await supabase
             .from('promo_codes')
-            .update({ is_active: nextStatus })
-            .eq('id', promoId);
+            .upsert(
+              {
+                id: promoId,
+                shop_id: shopRow.id,
+                is_active: nextStatus,
+              },
+              { onConflict: 'id' }
+            )
+            .select()
+            .single();
           if (toggleErr) {
-            console.error('[settings] promo_codes toggle failed:', toggleErr?.message || toggleErr);
+            if (toggleErr.code === '23505' || toggleErr.status === 409) {
+              setCouponError('This promo code already exists.');
+            } else {
+              console.error('[settings] promo_codes toggle failed:', toggleErr?.message || toggleErr);
+            }
+          } else if (!toggled) {
+            console.error('[settings] promo_codes toggle returned no row for', promoId);
           }
         }
       } catch (err) {
@@ -1624,12 +1651,25 @@ function BulkPricingCouponsSection({ shopSlug }) {
     touchedCoupons.current = true;
     if (isSupabaseConfigured && supabase) {
       try {
-        const { error: deleteErr } = await supabase.from('promo_codes').delete().eq('id', promoId);
+        const { data: deleted, error: deleteErr } = await supabase
+          .from('promo_codes')
+          .delete()
+          .eq('id', promoId)
+          .select()
+          .maybeSingle();
         if (deleteErr) {
-          console.error('[settings] promo_codes delete failed:', deleteErr?.message || deleteErr);
+          if (deleteErr.code === '23505' || deleteErr.status === 409) {
+            setCouponError('This promo code already exists.');
+          } else {
+            console.error('[settings] promo_codes delete failed:', deleteErr?.message || deleteErr);
+            setCouponError(deleteErr?.message || 'Could not delete promo code');
+          }
+        } else if (!deleted) {
+          console.error('[settings] promo_codes delete found no row for', promoId);
         }
       } catch (err) {
         console.error('[settings] handleDeletePromo threw:', err?.message || err);
+        setCouponError(err?.message || 'Could not delete promo code');
       }
     }
   };
