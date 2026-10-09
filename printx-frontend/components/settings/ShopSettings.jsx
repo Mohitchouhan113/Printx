@@ -2138,13 +2138,7 @@ function StaffAccessSection({ shopId }) {
                 <motion.button
                   whileHover={{ scale: 1.05 }}
                   whileTap={{ scale: 0.95 }}
-                  onClick={() => {
-                    setActiveStaff((prev) =>
-                      prev.map((s) =>
-                        s.id === staff.id ? { ...s, active: !s.active } : s
-                      )
-                    );
-                  }}
+                  onClick={() => handleToggleStaffSession(staff.id)}
                   className={`p-1.5 rounded-lg transition-colors ${
                     staff.active
                       ? 'bg-red-500/10 text-red-400 hover:bg-red-500/20'
