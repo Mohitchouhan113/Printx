@@ -414,57 +414,133 @@ function BroadcastModule() {
   useEffect(() => {
     if (isSupabaseConfigured && supabase) {
       supabase.from('announcements').select('id, title, message, type, is_active, created_at').order('created_at', { ascending: false }).limit(50)
-        .then(({ data }) => { if (data && data.length) setAnnouncements(data); });
+        .then(({ data, error }) => {
+          if (error) {
+            console.error('[admin] announcements load failed:', error.message, error.code);
+            return;
+          }
+          if (data) setAnnouncements(data);
+        });
     }
   }, []);
 
   const showToast = (type, msg) => { setToast({ type, msg }); setTimeout(() => setToast(null), 3500); };
 
+  /**
+   * Broadcast a new announcement.
+   *
+   * The DB round-trip happens FIRST and the returned row is what lands in
+   * local state — so when RLS rejects the write (42501 "new row violates
+   * row-level security policy") or the table/column is missing, the admin
+   * sees the real error instead of a phantom row that disappears on refresh.
+   */
   const handleBroadcast = async () => {
-    if (!form.title.trim() || !form.message.trim()) return;
+    if (!form.title.trim()) return;
     setBroadcasting(true);
     try {
-      if (isSupabaseConfigured && supabase) {
-        const { error } = await supabase.from('announcements').insert([{
-          title: form.title.trim(), message: form.message.trim(), type: form.type, is_active: true,
-        }]);
-        if (error) throw error;
-      }
-      const newAnn = {
-        id: Date.now(), title: form.title.trim(), message: form.message.trim(),
-        type: form.type, is_active: true, created_at: new Date().toISOString(),
+      const payload = {
+        title: form.title.trim(),
+        message: form.message.trim(),
+        type: form.type || 'info', // 'system', 'info', 'warning'
+        is_active: true,
       };
+
+      let newAnn = {
+        id: `local-${Date.now()}`,
+        ...payload,
+        created_at: new Date().toISOString(),
+      };
+
+      if (isSupabaseConfigured && supabase) {
+        const { data, error } = await supabase
+          .from('announcements')
+          .insert([payload])
+          .select()
+          .single();
+
+        if (error) {
+          console.error('[admin] error broadcasting announcement:', error.message, error.code);
+          alert('Broadcast failed: ' + error.message);
+          showToast('error', error.message || 'Broadcast failed');
+          return;
+        }
+        // Use the persisted row so toggling/deleting targets a real id.
+        newAnn = data || newAnn;
+      }
+
       setAnnouncements((prev) => [newAnn, ...prev]);
       setForm({ title: '', message: '', type: 'info' });
       showToast('success', 'Announcement broadcast to all students & vendors!');
     } catch (err) {
       console.error('[admin] broadcast error:', err);
-      showToast('error', err.message || 'Broadcast failed');
+      alert('Broadcast failed: ' + (err?.message || 'Unknown error'));
+      showToast('error', err?.message || 'Broadcast failed');
     } finally {
       setBroadcasting(false);
     }
   };
 
-  const toggleAnnouncement = (id) => {
-    setAnnouncements((prev) => prev.map((a) => {
-      if (a.id !== id) return a;
-      const next = !a.is_active;
-      // Persist so the banner on student/vendor pages reflects the switch.
-      if (isSupabaseConfigured && supabase) {
-        supabase.from('announcements').update({ is_active: next }).eq('id', id)
-          .then(({ error }) => { if (error) console.error('[admin] announcement toggle failed:', error.message); });
-      }
-      return { ...a, is_active: next };
-    }));
+  /**
+   * Toggle active/inactive. Optimistically flips the UI, then persists; a
+   * rejected write (RLS / missing row) rolls the flip back so the panel
+   * never claims a status the DB didn't accept.
+   */
+  const handleToggleActive = async (id, currentStatus) => {
+    const nextStatus = !currentStatus;
+
+    // Instant UI update
+    setAnnouncements((prev) => prev.map((a) => (a.id === id ? { ...a, is_active: nextStatus } : a)));
+
+    if (!isSupabaseConfigured || !supabase) {
+      showToast('success', 'Announcement visibility updated');
+      return;
+    }
+
+    const { error } = await supabase
+      .from('announcements')
+      .update({ is_active: nextStatus })
+      .eq('id', id);
+
+    if (error) {
+      console.error('[admin] toggle status error:', error.message, error.code);
+      // Revert the optimistic flip — the write did not land.
+      setAnnouncements((prev) => prev.map((a) => (a.id === id ? { ...a, is_active: currentStatus } : a)));
+      showToast('error', error.message || 'Status update failed');
+      return;
+    }
+
     showToast('success', 'Announcement visibility updated');
   };
 
-  const deleteAnnouncement = (id) => {
-    setAnnouncements((prev) => prev.filter((a) => a.id !== id));
-    if (isSupabaseConfigured && supabase) {
-      supabase.from('announcements').delete().eq('id', id)
-        .then(({ error }) => { if (error) console.error('[admin] announcement delete failed:', error.message); });
+  /** Remove an announcement; restore it (at its old index) if the delete was rejected. */
+  const handleDeleteAnnouncement = async (id) => {
+    let removed = null;
+    let removedAt = -1;
+    setAnnouncements((prev) => {
+      removedAt = prev.findIndex((a) => a.id === id);
+      removed = removedAt >= 0 ? prev[removedAt] : null;
+      return prev.filter((a) => a.id !== id);
+    });
+
+    if (!isSupabaseConfigured || !supabase) {
+      showToast('success', 'Announcement deleted');
+      return;
     }
+
+    const { error } = await supabase.from('announcements').delete().eq('id', id);
+    if (error) {
+      console.error('[admin] delete announcement error:', error.message, error.code);
+      if (removed) {
+        setAnnouncements((prev) => {
+          const next = prev.slice();
+          next.splice(removedAt < 0 ? 0 : removedAt, 0, removed);
+          return next;
+        });
+      }
+      showToast('error', error.message || 'Delete failed');
+      return;
+    }
+
     showToast('success', 'Announcement deleted');
   };
 
@@ -543,10 +619,10 @@ function BroadcastModule() {
                 <div className="text-sm font-bold text-white truncate">{ann.title}</div>
                 <div className="text-[11px] text-slate-500 truncate">{ann.message}</div>
               </div>
-              <button onClick={() => toggleAnnouncement(ann.id)} className="text-slate-400 hover:text-white transition-colors" title={ann.is_active ? 'Deactivate' : 'Activate'}>
+              <button onClick={() => handleToggleActive(ann.id, ann.is_active)} className="text-slate-400 hover:text-white transition-colors" title={ann.is_active ? 'Deactivate' : 'Activate'}>
                 {ann.is_active ? <ToggleRight className="w-5 h-5 text-emerald-400" /> : <ToggleLeft className="w-5 h-5 text-slate-600" />}
               </button>
-              <button onClick={() => deleteAnnouncement(ann.id)} className="text-slate-500 hover:text-red-400 transition-colors">
+              <button onClick={() => handleDeleteAnnouncement(ann.id)} className="text-slate-500 hover:text-red-400 transition-colors">
                 <Trash2 className="w-3.5 h-3.5" />
               </button>
             </motion.div>

@@ -132,6 +132,8 @@ export default function BroadcastBanner({ variant = 'student', className = '' })
         {visible.map((ann) => {
           const meta = TYPE_META[ann.type] || TYPE_META.info;
           const Icon = meta.Icon;
+          const typeLabel =
+            ann.type === 'warning' ? 'Warning' : ann.type === 'system' ? 'System' : 'Info';
           return (
             <motion.div
               key={String(ann.id)}
@@ -140,9 +142,9 @@ export default function BroadcastBanner({ variant = 'student', className = '' })
               exit={{ opacity: 0, y: -8, height: 0 }}
               className={`flex items-start gap-3 rounded-xl border px-3.5 py-2.5 backdrop-blur-xl shadow-[0_0_24px_rgba(0,0,0,0.25)] ${meta.cls}`}
             >
-              <span className="mt-0.5 shrink-0 inline-flex items-center gap-1 rounded-md bg-black/20 px-1.5 py-0.5 text-[9px] font-black uppercase tracking-widest">
+              <span className={`mt-0.5 shrink-0 inline-flex items-center gap-1 rounded-md bg-black/20 px-1.5 py-0.5 text-[9px] font-black uppercase tracking-widest ${meta.head}`}>
                 <Megaphone className="w-3 h-3" />
-                Notice
+                {typeLabel}
               </span>
               <div className="min-w-0 flex-1">
                 <div className={`flex items-center gap-1.5 text-xs font-black ${meta.head}`}>
