@@ -60,7 +60,7 @@ import {
   CircleDollarSign,
 } from 'lucide-react';
 import { supabase, isSupabaseConfigured } from '../../../lib/supabaseClient';
-import { selectStrict } from '../../../lib/supabaseSelect';
+import { selectStrict, isMissingColumn } from '../../../lib/supabaseSelect';
 import { isOnlineMethod } from '../../../lib/eodReport';
 import { resolveSubscriptionState, SUBSCRIPTION_META } from '../../../lib/subscription';
 import {
@@ -1125,15 +1125,23 @@ function ShopKYCModule() {
     setLoading(true);
     try {
       if (isSupabaseConfigured && supabase) {
-        // Strict select with progressive column-drop: full migration-aware
-        // list first (phone/subscription_status/trial_ends_at pending
-        // 20260928_core_features), probe-verified live columns on drift.
-        const { data, error } = await selectStrict(
-          (cols) => supabase.from('shops').select(cols).order('created_at', { ascending: false }),
-          'id, name, slug, phone, upi_id, owner_id, is_verified, is_active, is_approved, status, plan_type, plan_expires_at, plan_status, subscription_plan, subscription_expires_at, subscription_status, trial_ends_at, payment_status, created_at',
-          'id, name, slug, upi_id, owner_id, is_verified, is_active, is_approved, status, plan_type, plan_expires_at, plan_status, subscription_plan, subscription_expires_at, payment_status, created_at',
-          'shops:admin'
-        );
+        // Strict select with progressive column-drop — THREE tiers, not two.
+        // `subscription_status` exists now but `trial_ends_at` does not, so a
+        // two-tier fallback dropped BOTH and the card badge could never show
+        // the Trial status the editor had just saved.
+        const runShops = (cols) =>
+          supabase.from('shops').select(cols).order('created_at', { ascending: false });
+        const TIER_FULL =
+          'id, name, slug, phone, upi_id, owner_id, is_verified, is_active, is_approved, status, plan_type, plan_expires_at, plan_status, subscription_plan, subscription_expires_at, subscription_status, trial_ends_at, payment_status, created_at';
+        const TIER_NO_TRIAL =
+          'id, name, slug, phone, upi_id, owner_id, is_verified, is_active, is_approved, status, plan_type, plan_expires_at, plan_status, subscription_plan, subscription_expires_at, subscription_status, payment_status, created_at';
+        const TIER_BASE =
+          'id, name, slug, upi_id, owner_id, is_verified, is_active, is_approved, status, plan_type, plan_expires_at, plan_status, subscription_plan, subscription_expires_at, payment_status, created_at';
+        let res = await selectStrict(runShops, TIER_FULL, TIER_NO_TRIAL, 'shops:admin');
+        if (res?.error && isMissingColumn(res.error)) {
+          res = await selectStrict(runShops, TIER_NO_TRIAL, TIER_BASE, 'shops:admin:base');
+        }
+        const { data, error } = res;
         if (error) throw error;
         console.log('Fetched Vendors Count:', (data || []).length);
         setShops(data || []);
@@ -1492,9 +1500,9 @@ function ShopKYCModule() {
       <AnimatePresence>
         {editingSub && (
           <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4" onClick={(e) => e.target === e.currentTarget && setEditingSub(null)}>
-            <motion.div initial={{ scale: 0.95, y: 20 }} animate={{ scale: 1, y: 0 }} exit={{ scale: 0.95, y: 20 }} className="w-full max-w-md bg-[#111827] border border-[#1E2D4A] rounded-2xl shadow-2xl">
-              {/* Header */}
-              <div className="flex items-center justify-between px-5 py-4 border-b border-[#1E2D4A]">
+            <motion.div initial={{ scale: 0.95, y: 20 }} animate={{ scale: 1, y: 0 }} exit={{ scale: 0.95, y: 20 }} className="w-full max-w-md max-h-[90vh] overflow-y-auto flex flex-col bg-[#111827] border border-[#1E2D4A] rounded-2xl shadow-2xl">
+              {/* Header — sticky so the title stays visible while scrolling */}
+              <div className="sticky top-0 z-10 flex items-center justify-between px-5 py-4 border-b border-[#1E2D4A] bg-[#111827]">
                 <div>
                   <h3 className="text-sm font-bold text-white">Edit Subscription</h3>
                   <p className="text-[11px] text-slate-500 mt-0.5">{editingSub.name}</p>
@@ -1639,8 +1647,8 @@ function ShopKYCModule() {
                 </div>
               </div>
 
-              {/* Footer */}
-              <div className="flex items-center justify-end gap-2 px-5 py-4 border-t border-[#1E2D4A]">
+              {/* Footer — sticky bottom so Save/Cancel are never cut off */}
+              <div className="sticky bottom-0 z-10 flex items-center justify-end gap-2 px-5 py-4 border-t border-[#1E2D4A] bg-[#111827]">
                 <button onClick={() => setEditingSub(null)} className="px-4 py-2 rounded-xl text-xs text-slate-400 hover:text-white transition-colors">Cancel</button>
                 <motion.button whileHover={{ scale: 1.02 }} whileTap={{ scale: 0.97 }} onClick={saveSubscription} disabled={savingSub} className="inline-flex items-center gap-1.5 px-5 py-2 rounded-xl bg-gradient-to-r from-cyan-500 to-indigo-600 text-white text-xs font-bold shadow-lg shadow-cyan-500/20 disabled:opacity-50">{savingSub && <Loader2 className="w-3.5 h-3.5 animate-spin" />}{savingSub ? 'Saving…' : 'Save Subscription'}</motion.button>
               </div>
