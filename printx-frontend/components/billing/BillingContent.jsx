@@ -148,30 +148,32 @@ function isDemoPlanId(raw) {
  *
  * @param {Array}  rows       — live `plans` rows
  * @param {string[]} activeKeys — admin_settings.platform_settings.active_plans
- *   Step 1: keep only rows the Super Admin switched ON in `plans.is_active`.
- *   Step 2: narrow further to the `active_plans` allow-list — but only when that
- *   list still matches at least one live row. A list saved before a plan was
- *   renamed/deleted is treated as stale and ignored, and if the allow-list
- *   contradicts `plans.is_active` entirely we trust the live per-plan flag
- *   rather than rendering an empty pricing page.
+ *
+ * `plans.is_active` is the Super Admin's direct per-plan switch and is the
+ * single source of truth: EVERY row that reports active is returned. The
+ * `active_plans` mirror is never allowed to hide one — an earlier version
+ * intersected the two, and because the admin toggle only wrote `is_active`,
+ * the mirror went stale and hid a plan the Super Admin had just enabled.
+ * The mirror is only consulted to report that it is out of step.
+ *
  * @returns {Array} the rows to render
  */
 export function selectEnabledPlans(rows, activeKeys = []) {
   const data = Array.isArray(rows) ? rows : [];
   const enabled = data.filter((p) => planIsActive(p));
+
   const keys = (Array.isArray(activeKeys) ? activeKeys : []).filter((k) => typeof k === 'string' && k);
-  if (keys.length === 0) return enabled;
-
-  const matchesLive = keys.some((k) => data.some((p) => p.code === k || p.id === k));
-  if (!matchesLive) return enabled; // stale allow-list
-
-  const allow = new Set(keys);
-  const filtered = enabled.filter((p) => allow.has(p.code) || allow.has(p.id));
-  if (filtered.length === 0 && enabled.length > 0) {
-    console.warn('[billing] active_plans allow-list contradicts plans.is_active — using plans.is_active');
-    return enabled;
+  if (keys.length > 0) {
+    const allow = new Set(keys);
+    const mirrored = enabled.filter((p) => allow.has(p.code) || allow.has(p.id));
+    if (mirrored.length !== enabled.length) {
+      console.warn(
+        '[billing] platform_settings.active_plans is out of step with plans.is_active — rendering plans.is_active. Re-save Active Plans in the Super Admin panel.'
+      );
+    }
   }
-  return filtered;
+
+  return enabled;
 }
 
 export default function BillingContent({
@@ -331,10 +333,19 @@ export default function BillingContent({
         /* Step 2 — live rows from `plans` (fetchPlans is column-tolerant). */
         const { data, error } = await fetchPlans();
         if (cancelled) return;
-        if (error || !data || data.length === 0) return; // table may not exist yet
+        if (error || !data || data.length === 0) {
+          /* The plans table is unreadable/empty — fall back to the Super
+           * Admin's allow-list rendered over the static catalog, instead of
+           * showing every hardcoded plan. No .single()/.maybeSingle()/.limit(1)
+           * anywhere in this query: all active rows are fetched. */
+          if (activeKeys.length > 0) {
+            setDynamicPlans(activeKeys.map((code) => ({ code })));
+          }
+          return;
+        }
 
-        /* Steps 3 + 4 — enabled rows, narrowed by the allow-list (see
-         * selectEnabledPlans for the stale/contradictory-list rules). */
+        /* Steps 3 + 4 — every row the Super Admin switched ON (see
+         * selectEnabledPlans: plans.is_active is authoritative). */
         const filtered = selectEnabledPlans(data, activeKeys);
 
         if (cancelled) return;
@@ -544,20 +555,24 @@ export default function BillingContent({
           </p>
         </div>
       )}
-      {renderPlanIds.map((planId, i) => (
-        <PlanCard
-          key={planId}
-          planId={planId}
-          index={i}
-          currentPlan={currentPlan}
-          isYearly={isYearly}
-          busyPlan={busyPlan}
-          phase={phase}
-          shopStatus={planStatus}
-          onPay={() => upgrade(planId)}
-          getPlanPrice={getPlanPrice}
-        />
-      ))}
+      {renderPlanIds.length > 0 && (
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          {renderPlanIds.map((planId, i) => (
+            <PlanCard
+              key={planId}
+              planId={planId}
+              index={i}
+              currentPlan={currentPlan}
+              isYearly={isYearly}
+              busyPlan={busyPlan}
+              phase={phase}
+              shopStatus={planStatus}
+              onPay={() => upgrade(planId)}
+              getPlanPrice={getPlanPrice}
+            />
+          ))}
+        </div>
+      )}
 
       {/* --------------------- Payment error ----------------------- */}
       <AnimatePresence>

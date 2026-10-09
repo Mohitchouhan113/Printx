@@ -74,6 +74,7 @@ import {
   loadAdminSettings,
   loadPlatformSettings,
   savePlatformSettings,
+  updatePlatformSettings,
   SETTINGS_KEYS,
   DEFAULT_OFFER,
 } from '../../../lib/adminSettings';
@@ -2068,15 +2069,46 @@ function PlansModule() {
     setTimeout(() => setToast(null), 4500);
   };
 
+  /**
+   * Mirror `plans.is_active` into `admin_settings.platform_settings.active_plans`.
+   *
+   * The array is DERIVED from the full row set rather than appended to or
+   * overwritten in place, so it can never (a) drop a plan someone else enabled,
+   * (b) keep a code for a plan that was just disabled, or (c) drift the way the
+   * old code did — it always equals the set of plans the Super Admin has on.
+   *
+   * @param {Array} rows — the complete `plans` list, including the just-toggled
+   *                       row. Never called with an empty list (that would wipe
+   *                       the mirror on a failed load).
+   */
+  const syncActivePlans = async (rows) => {
+    if (!isSupabaseConfigured || !supabase) return { ok: true, table: null, error: null };
+    const usable = (Array.isArray(rows) ? rows : []).filter((p) => p?.code);
+    if (usable.length === 0) return { ok: true, table: null, error: null };
+    const active_plans = usable.filter((p) => planIsActive(p)).map((p) => p.code);
+    const res = await updatePlatformSettings({ active_plans });
+    if (!res.ok) {
+      console.error('[admin plans] active_plans mirror failed:', res.error?.message || res.error);
+    }
+    return res;
+  };
+
   /** Persist the active flag by `code` — never optimistically without a check. */
   const togglePlanActive = async (plan) => {
     const next = !planIsActive(plan);
     const snapshot = plan;
-    setPlans((prev) => prev.map((p) => p.code === plan.code ? { ...p, is_active: next, active: next } : p));
+    const nextRows = plans.map((p) => (p.code === plan.code ? { ...p, is_active: next, active: next } : p));
+    setPlans(nextRows);
     const res = await setPlanActive(plan.code, next);
     if (!res.ok) {
       setPlans((prev) => prev.map((p) => p.code === plan.code ? { ...snapshot } : p));
       notify('error', `Could not save ${plan.name}: ${res.error?.message || 'update rejected'}`);
+      return;
+    }
+    // Keep the allow-list in step, preserving every other active plan.
+    const mirror = await syncActivePlans(nextRows);
+    if (!mirror.ok) {
+      notify('error', `${plan.name} saved, but active_plans mirror failed — open Settings → Active Plans and Save.`);
       return;
     }
     notify('success', `${plan.name} ${next ? 'enabled' : 'disabled'} — saved`);
@@ -2122,7 +2154,14 @@ function PlansModule() {
       return;
     }
     setPlans((prev) => prev.map((p) => p.code === editingPlan.code ? { ...p, ...(res.data || payload) } : p));
+    // The edit form can change `active` too — mirror the resulting set.
+    const nextRows = plans.map((p) => (p.code === editingPlan.code ? { ...p, ...(res.data || payload) } : p));
+    const mirror = await syncActivePlans(nextRows);
     setEditingPlan(null);
+    if (!mirror.ok) {
+      notify('error', 'Plan saved, but active_plans mirror failed — re-open Settings → Active Plans and Save.');
+      return;
+    }
     notify('success', 'Plan pricing updated live — saved to Supabase');
   };
 
@@ -2144,8 +2183,11 @@ function PlansModule() {
         return;
       }
       setPlans((prev) => [...prev, res.data]);
+      // A new plan starts active — add it to the allow-list too.
+      await syncActivePlans([...plans, res.data]);
     } else {
       setPlans((prev) => [...prev, { ...payload, code: payload.code }]);
+      await syncActivePlans([...plans, { ...payload, code: payload.code }]);
     }
     setShowCreate(false);
     setEditForm({ name: '', code: '', original_price: '', offer_price: '', badge_tag: '', features: [], newFeature: '', active: true });

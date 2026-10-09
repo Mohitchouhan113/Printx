@@ -208,6 +208,25 @@ export async function savePlatformSettings(value) {
   return upsertAdminSetting(PLATFORM_SETTINGS_KEY, normalizePlatformSettings(value));
 }
 
+/**
+ * Merge a partial patch into the consolidated `platform_settings` row.
+ *
+ * Read-modify-write on purpose: a narrow update such as
+ * `{ active_plans: [...] }` must never wipe the phone / offer fields stored
+ * alongside it, and must never overwrite other entries already in the array
+ * (the caller passes the full new array).
+ *
+ * @returns {Promise<{ ok: boolean, table: string|null, error: any }>}
+ */
+export async function updatePlatformSettings(patch) {
+  if (!isSupabaseConfigured || !supabase) {
+    return { ok: false, table: null, error: new Error('Supabase not configured') };
+  }
+  const { value, table, error } = await loadPlatformSettings();
+  if (error) return { ok: false, table, error };
+  return savePlatformSettings({ ...(value || {}), ...patch });
+}
+
 /** Test helper — forget which table answered (used by unit tests). */
 export function _resetTableCache() {
   resolvedTable = undefined;
