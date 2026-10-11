@@ -1,15 +1,14 @@
 /**
- * Paytm Soundbox-style counter voice alerts — Web Speech Synthesis.
+ * Counter Soundbox voice notification — announces each new print order
+ * in Hindi using Web Speech Synthesis with the exact phrase:
  *
- * Announces new orders in a Hindi/English (hi-IN / en-IN) voice using the
- * exact engine script:
- *
- *   "Naya order aaya hai! [Token No] number token, [Total Pages] pages,
- *    Total amount [Amount] rupees."
+ *   "Naya order aaya hai, token number {token_number}"
  *
  * Voice selection: an explicit hi-IN voice wins, then en-IN, then any
  * Hindi/English voice, then whatever the OS default is (utterance.lang
  * still steers the engine when no voice matches).
+ *
+ * Phrase style: rate 0.9 (natural), pitch 1.0, lang hi-IN.
  */
 
 const PREFERRED_LANGS = ['hi-IN', 'en-IN'];
@@ -48,39 +47,38 @@ export function primeVoices() {
 /**
  * Speak one order alert. Returns true when speech was dispatched.
  *
- * `order` is an `orders` sidecar row: token_no / token_number, pages,
- * bw_pages / color_pages and total_amount (walk-ins + new uploads set it;
- * older rows fall back to the default B&W/Color rates).
+ * Uses the Counter Soundbox voice phrase:
+ *   "Naya order aaya hai, token number {token_number}"
+ *
+ * `order` is an `orders` sidecar row: token_no / token_number.
+ * The token number is extracted from token_no (daily integer) or
+ * token_number (legacy string like #TK-32); non-digit characters are
+ * stripped so the announcement always speaks the bare number.
  */
 export function speakOrderAlert(order = {}) {
   if (typeof window === 'undefined' || !window.speechSynthesis) return false;
 
-  const token =
+  // Exact token number for the voice announcement — default to "1" when the
+  // row has no token yet (e.g. an optimistic echo before the server assigns one).
+  const rawToken =
     order.token_no != null
       ? String(order.token_no)
-      : String(order.token_number || '').replace(/[^\d]/g, '') || '?';
+      : String(order.token_number || '').replace(/[^\d]/g, '') || '1';
 
-  const pages = Number(order.pages ?? order.page_count) || 0;
-
-  let amount = Number(order.total_amount);
-  if (!Number.isFinite(amount) || amount <= 0) {
-    const bw = Number(order.bw_pages);
-    const color = Number(order.color_pages);
-    amount = Number.isFinite(bw) && Number.isFinite(color) ? bw * 2 + color * 10 : 0;
-  }
-  amount = Math.round(amount);
-
-  const text = `Naya order aaya hai! ${token} number token, ${pages} pages, Total amount ${amount} rupees.`;
+  const message = `Naya order aaya hai, token number ${rawToken}`;
 
   try {
     const synth = window.speechSynthesis;
     synth.cancel(); // never queue behind a previous announcement
-    const utter = new SpeechSynthesisUtterance(text);
+
+    const utter = new SpeechSynthesisUtterance(message);
+    utter.lang = 'hi-IN'; // Hindi voice
+    utter.rate = 0.9;     // natural speaking speed
+    utter.pitch = 1.0;
+
     const voice = pickVoice();
     if (voice) utter.voice = voice;
-    utter.lang = (voice && voice.lang) || 'hi-IN';
-    utter.rate = 1;
-    utter.pitch = 1;
+
     synth.speak(utter);
     return true;
   } catch (err) {
