@@ -637,7 +637,7 @@ export function SoundboxToggle() {
   useEffect(() => {
     setMounted(true);
     try {
-      setOn(localStorage.getItem('printx_soundbox') !== 'off');
+      setOn(localStorage.getItem('printx_soundbox_enabled') !== 'false');
     } catch {
       /* storage blocked — default On */
     }
@@ -650,7 +650,7 @@ export function SoundboxToggle() {
     const next = !on;
     setOn(next);
     try {
-      localStorage.setItem('printx_soundbox', next ? 'on' : 'off');
+      localStorage.setItem('printx_soundbox_enabled', String(next));
     } catch {
       /* storage blocked — state still syncs for this session */
     }
@@ -663,20 +663,54 @@ export function SoundboxToggle() {
   if (!mounted) return null; // SSR-safe
 
   return (
-    <motion.button
-      type="button"
-      whileTap={{ scale: 0.97 }}
-      onClick={toggle}
-      aria-pressed={on}
-      title="Paytm-style counter voice alert — speaks every new order in Hindi/English"
-      className={`flex shrink-0 items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-full border text-[10px] font-black transition-colors ${
-        on
-          ? 'bg-violet-500/15 border-violet-400/40 text-violet-200 shadow-[0_0_12px_rgba(139,92,246,0.35)]'
-          : 'bg-[#0B132B] border-[#1E2D4A] text-slate-500 hover:text-slate-300'
-      }`}
-    >
-      🔊 Counter Soundbox: {on ? 'On' : 'Off'}
-    </motion.button>
+    <div className="flex items-center gap-1.5">
+      <motion.button
+        type="button"
+        whileTap={{ scale: 0.97 }}
+        onClick={toggle}
+        aria-pressed={on}
+        title={'Counter Soundbox — Paytm-style counter voice alert. Speaks every new order in Hindi: "Naya order aaya hai, token number {token}".'}
+        className={`flex shrink-0 items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-full border text-[10px] font-black transition-colors ${
+          on
+            ? 'bg-violet-500/15 border-violet-400/40 text-violet-200 shadow-[0_0_12px_rgba(139,92,246,0.35)]'
+            : 'bg-[#0B132B] border-[#1E2D4A] text-slate-500 hover:text-slate-300'
+        }`}
+      >
+        🔊 Counter Soundbox: {on ? 'On' : 'Off'}
+      </motion.button>
+      <button
+        type="button"
+        onClick={() => {
+          // Guarantee-of-audio test: play the beep + Hindi voice now so the
+          // shop owner can confirm sound works before a real order arrives.
+          if (typeof window !== 'undefined' && window.triggerSoundboxAlert) {
+            window.triggerSoundboxAlert({ token: '99' });
+          } else if (typeof window !== 'undefined' && window.speakOrderAlert) {
+            const msg = new SpeechSynthesisUtterance('Naya order aaya hai, token number 99');
+            msg.lang = 'hi-IN';
+            msg.rate = 0.9;
+            msg.pitch = 1.0;
+            if (window.speechSynthesis) {
+              window.speechSynthesis.cancel();
+              window.speechSynthesis.speak(msg);
+            }
+          } else {
+            // Last-resort direct call if the module hasn't exposed itself yet.
+            import('../../lib/soundbox.js').then((m) => {
+              if (m?.triggerSoundboxAlert) m?.triggerSoundboxAlert({ token: '99' });
+            }).catch(() => {});
+          }
+        }}
+        title={'Play a test beep + Hindi voice announcement ("Naya order aaya hai, token number 99")'}
+        className={`flex shrink-0 items-center gap-1.5 px-2 py-1.5 rounded-full border text-[10px] font-black transition-colors ${
+          on
+            ? 'bg-emerald-500/15 border-emerald-400/40 text-emerald-200 hover:bg-emerald-500/25'
+            : 'bg-[#0B132B] border-[#1E2D4A] text-slate-500 hover:text-slate-300'
+        }`}
+      >
+        ✅ Test Sound
+      </button>
+    </div>
   );
 }
 

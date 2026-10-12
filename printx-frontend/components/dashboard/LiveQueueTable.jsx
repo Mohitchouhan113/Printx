@@ -23,7 +23,14 @@ import { supabase, isSupabaseConfigured } from '../../lib/supabaseClient';
 import useShopQueue from '../../hooks/useShopQueue';
 import { getBinding, getPaperMeta } from '../../lib/pricing';
 import { isPriorityRow } from '../../lib/priority';
-import { speakOrderAlert, primeVoices } from '../../lib/voiceAlert';
+import { triggerSoundboxAlert, primeVoices } from '../../lib/soundbox';
+import {
+  triggerSilentPrint,
+  printHtmlDocument,
+  buildTestPrintPage,
+  isPrintAgentOnline,
+  AUTO_PRINT_KEY,
+} from '../../lib/printer';
 import { onAudioUnlock } from '../../lib/audioUnlock';
 import OrderPreviewModal from './OrderPreviewModal';
 
@@ -63,6 +70,13 @@ export default function LiveQueueTable({ shopId = null, initialOrders = [], onNe
   /* Tokens of jobs this session has already auto-printed (dedupe across
    * BroadcastChannel + Realtime double-delivery). */
   const autoPrintedRef = useRef(new Set());
+  /* Fleet presence — the desktop print agent (/agent) heartbeats
+   * shops.last_active_at every 30s. While that heartbeat is fresh the agent
+   * owns spooling, and the browser must NOT also open its print dialogue.
+   * A ref mirrors the value so the realtime INSERT handler reads it without
+   * ever needing to re-subscribe. */
+  const agentOnlineRef = useRef(false);
+  const [agentOnline, setAgentOnline] = useState(false);
   /* Sidecar binding map (id → orders row) — binding_type/binding_cost live
    * in the `orders` table (print_jobs has no binding columns). A ref keeps
    * the map stable across re-renders and lets an orders event that arrives
@@ -194,11 +208,13 @@ export default function LiveQueueTable({ shopId = null, initialOrders = [], onNe
   /* ------- Counter Soundbox state (localStorage + nav-bar event) ------- */
   useEffect(() => {
     try {
-      soundboxRef.current = localStorage.getItem('printx_soundbox') !== 'off';
+      // Read the same flag the soundbox module uses so the UI and audio
+      // engine agree on whether the counter soundbox is on or off.
+      soundboxRef.current = localStorage.getItem('printx_soundbox_enabled') !== 'false';
     } catch {
       soundboxRef.current = true;
     }
-    primeVoices(); // warm the TTS voice list (Chrome loads it async)
+    primeVoices(); // warm voice list + register window.triggerSoundboxAlert
     const onSoundbox = (e) => {
       soundboxRef.current = Boolean(e?.detail);
     };
@@ -307,57 +323,82 @@ export default function LiveQueueTable({ shopId = null, initialOrders = [], onNe
   /* Ref mirror so flipping the toggle never forces a realtime re-subscribe
    * (which could drop a job during the re-handshake). */
   const autoPrintRef = useRef(autoPrint);
+  /* Same value, as state, purely so the Auto-Print badge re-renders. */
+  const [autoPrintOn, setAutoPrintOn] = useState(autoPrint);
   useEffect(() => {
     autoPrintRef.current = autoPrint;
+    setAutoPrintOn(autoPrint);
   }, [autoPrint]);
 
+  /*
+   * Keep the flag live without a refresh: `printx:auto-print` covers another
+   * component in this tab flipping it, and the native `storage` event covers
+   * OTHER tabs (a second counter screen shares localStorage but not React
+   * state) — so a job landing in this tab prints the moment the owner turns
+   * Auto-Print Mode on anywhere.
+   */
+  useEffect(() => {
+    const apply = (next) => {
+      autoPrintRef.current = next;
+      setAutoPrintOn(next);
+    };
+    const onFlag = (e) => apply(!!e?.detail);
+    const onStorage = (e) => {
+      if (e?.key !== AUTO_PRINT_KEY || e.newValue == null) return;
+      apply(e.newValue === 'true' || e.newValue === '1');
+    };
+    window.addEventListener('printx:auto-print', onFlag);
+    window.addEventListener('storage', onStorage);
+    return () => {
+      window.removeEventListener('printx:auto-print', onFlag);
+      window.removeEventListener('storage', onStorage);
+    };
+  }, []);
+
+  /*
+   * Fleet presence probe. Polled rather than subscribed — the `shops` row is
+   * not part of the orders channel. Every failure mode (no client, RLS
+   * blocking the read, or the last_active_at column not migrated yet) resolves
+   * to "offline", which leaves the browser print path exactly as it behaves
+   * today. The 20s cadence sits comfortably inside the 90s freshness window.
+   */
+  useEffect(() => {
+    if (!liveMode) return;
+    let cancelled = false;
+    const probe = async () => {
+      const online = await isPrintAgentOnline(supabase, shopId);
+      if (cancelled) return;
+      agentOnlineRef.current = online;
+      setAgentOnline(online);
+    };
+    probe();
+    const id = setInterval(probe, 20_000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [liveMode, shopId]);
+
   /**
-   * Fire the browser print flow for a job's file: hidden iframe → print()
-   * dialog. Cross-origin files that block scripted print fall back to
-   * window.open(url, '_blank'). A missing or invalid file_url (raw storage
-   * path, expired/empty link) returns false WITHOUT opening anything — the
+   * Fire the print flow for a job's file — the shared,
+   * fleet-wide implementation lives in lib/printer.js (invisible iframe →
+   * print(), cross-origin fallback to a real tab, self-cleaning frame).
+   * Returns false when the row has no printable http(s) file_url so the
    * caller degrades to an "auto-queued" toast instead of a broken tab.
    */
-  const triggerPrint = useCallback((order) => {
-    const url = order?.file_url;
-    let validUrl = false;
-    try {
-      // Absolute http(s) only — relative storage paths would 404 in a tab.
-      const u = new URL(url);
-      validUrl = u.protocol === 'http:' || u.protocol === 'https:';
-    } catch {
-      validUrl = false;
-    }
-    if (!validUrl) return false;
-    try {
-      const iframe = document.createElement('iframe');
-      iframe.src = url;
-      iframe.setAttribute('aria-hidden', 'true');
-      iframe.style.cssText = 'position:fixed;right:0;bottom:0;width:0;height:0;border:0;opacity:0;';
-      iframe.onload = () => {
-        try {
-          iframe.contentWindow?.focus();
-          iframe.contentWindow?.print();
-        } catch {
-          // Cross-origin print blocked — open the file directly instead.
-          window.open(url, '_blank', 'noopener,noreferrer');
-        }
-        // Give the dialog time to spin up before dropping the frame.
-        setTimeout(() => iframe.remove(), 60_000);
-      };
-      iframe.onerror = () => iframe.remove();
-      document.body.appendChild(iframe);
-      return true;
-    } catch {
-      return false;
-    }
-  }, []);
+  const triggerPrint = useCallback((order) => triggerSilentPrint(order?.file_url), []);
 
   /**
    * Auto-print a freshly inserted job: mark PRINTING locally with the
-   * ⚡ Auto-Printed badge, persist status → 'PRINTING' in Supabase, then
-   * trigger the document print. Deduped per job id (Realtime + cross-tab
-   * BroadcastChannel can both announce the same job).
+   * ⚡ Auto-Printed badge and persist status → 'PRINTING' in Supabase, then
+   * hand the job to whoever owns spooling:
+   *   · print agent online → nothing more to do here; the agent prints it
+   *     silently on the shop PC (opening the browser dialogue too would print
+   *     the same order twice — the agent reads `orders`, we write `print_jobs`,
+   *     so neither side can see the other's claim on the job)
+   *   · no agent → the shared hidden-frame browser print
+   * Deduped per job id (Realtime + cross-tab BroadcastChannel can both
+   * announce the same job).
    */
   const autoPrintJob = useCallback(
     async (order) => {
@@ -378,6 +419,15 @@ export default function LiveQueueTable({ shopId = null, initialOrders = [], onNe
           .update({ status: 'PRINTING' })
           .eq('id', order.id);
         if (error) console.error('[auto-print] status update failed:', error);
+      }
+
+      // Fleet hand-off — the shop PC's agent spools this one silently.
+      if (agentOnlineRef.current) {
+        setToast({
+          type: 'success',
+          message: `⚡ ${order.token_number} sent to the print agent`,
+        });
+        return;
       }
 
       const printed = triggerPrint(order);
@@ -521,8 +571,11 @@ export default function LiveQueueTable({ shopId = null, initialOrders = [], onNe
             // New order landed in the database → ring the counter chime and
             // notify the parent (instant queue append happens in applyBinding).
             if (Date.now() - lastChimeAtRef.current > 2000) newJobChime();
-            speakOrderAlert(payload.new);
             onNewOrder?.(payload.new);
+            // 📢 Counter Soundbox — guaranteed audio alert for the new order.
+            // Uses the soundbox module's triggerSoundboxAlert which plays a
+            // Web Audio beep first, then the Hindi voice ~300ms later.
+            triggerSoundboxAlert({ order: payload.new });
           }
         }
       )
@@ -567,7 +620,7 @@ export default function LiveQueueTable({ shopId = null, initialOrders = [], onNe
         /* noop */
       }
     };
-  }, [shopId, newJobChime, onNewOrder, autoPrintJob, speakOrderAlert]);
+  }, [shopId, newJobChime, onNewOrder, autoPrintJob, triggerSoundboxAlert]);
 
   /* ------------------- BroadcastChannel cross-tab fallback ------------------- */
   useEffect(() => {
@@ -913,43 +966,13 @@ export default function LiveQueueTable({ shopId = null, initialOrders = [], onNe
 
   /* ------------------- Print action ------------------- */
   const printFile = useCallback((order) => {
-    // Only absolute http(s) URLs are printable — a raw storage path would
-    // just 404 inside the hidden iframe.
-    let validUrl = false;
-    try {
-      const u = new URL(order?.file_url);
-      validUrl = u.protocol === 'http:' || u.protocol === 'https:';
-    } catch {
-      validUrl = false;
-    }
-    if (!validUrl) return;
-    // Hidden iframe + print() → opens the dialogue without leaving the page.
-    // Popup blockers are kinder to iframes than window.open in click handlers.
-    try {
-      const existing = document.getElementById('print-frame');
-      if (existing) existing.remove();
-      const frame = document.createElement('iframe');
-      frame.id = 'print-frame';
-      frame.style.position = 'fixed';
-      frame.style.right = '0';
-      frame.style.bottom = '0';
-      frame.style.width = '0';
-      frame.style.height = '0';
-      frame.style.border = '0';
-      frame.src = order.file_url;
-      frame.onload = () => {
-        try {
-          frame.contentWindow.focus();
-          frame.contentWindow.print();
-        } catch {
-          // Cross-origin (Supabase signed URL) — fall back to a new tab
-          window.open(order.file_url, '_blank', 'noopener');
-        }
-      };
-      document.body.appendChild(frame);
-    } catch {
-      window.open(order.file_url, '_blank', 'noopener');
-    }
+    // Manual print from a queue card — the same fleet-wide hidden-frame path
+    // the auto-print flow uses. URL validation, the self-cleaning frame and
+    // the cross-origin → new-tab fallback all live in lib/printer.js, so this
+    // is a deliberate browser print (the vendor asked for it) rather than a
+    // second copy of the frame logic. Returns false when the row has no
+    // printable http(s) file_url, so a dead click stays silent.
+    return triggerSilentPrint(order?.file_url);
   }, []);
 
   return (
@@ -999,6 +1022,69 @@ export default function LiveQueueTable({ shopId = null, initialOrders = [], onNe
           {muted ? <VolumeX className="w-3.5 h-3.5" /> : <Volume2 className="w-3.5 h-3.5" />}
           {muted ? 'Muted' : 'Sound on'}
         </button>
+
+        {/* 🖨️ Fleet check — prints a test page through the SAME hidden-frame
+            path Auto-Print Mode uses, so the counter can confirm the
+            browser → printer link before a real job depends on it. */}
+        <button
+          type="button"
+          onClick={() => {
+            const ok = printHtmlDocument(
+              buildTestPrintPage({ printerName: 'Counter printer' }),
+              (printed) =>
+                setToast({
+                  type: printed ? 'success' : 'error',
+                  message: printed
+                    ? '🖨️ Test page sent to the printer'
+                    : '⚠️ Test print blocked — check the browser print permission',
+                })
+            );
+            if (!ok) setToast({ type: 'error', message: '⚠️ Test print unavailable in this browser' });
+          }}
+          className="inline-flex items-center gap-1.5 text-xs font-bold px-2.5 py-1.5 rounded-lg bg-[#1E2D4A] border border-slate-600/40 text-slate-300 hover:text-white transition-colors"
+          title="Test Print — send a test page to the printer through the auto-print path"
+        >
+          <Printer className="w-3.5 h-3.5" />
+          Test Print
+        </button>
+
+        {/* Auto-Print Mode state — mirrors the dashboard toggle so the queue
+            always shows whether new jobs fire at the printer automatically. */}
+        <span
+          className={`inline-flex items-center gap-1.5 text-xs font-bold px-2.5 py-1.5 rounded-lg border ${
+            autoPrintOn
+              ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40'
+              : 'bg-slate-800/60 text-slate-400 border-slate-600/40'
+          }`}
+          title={
+            autoPrintOn
+              ? 'Auto-Print Mode ON — every new order is sent to the printer automatically'
+              : 'Auto-Print Mode OFF — new orders wait for a manual print'
+          }
+        >
+          <Zap className="w-3.5 h-3.5" />
+          Auto-Print {autoPrintOn ? 'ON' : 'OFF'}
+        </span>
+
+        {/* Who owns spooling: the shop PC's fleet agent (silent, no dialogue)
+            or this browser. Live mode only — demo data has no fleet. */}
+        {liveMode && (
+          <span
+            className={`inline-flex items-center gap-1.5 text-xs font-bold px-2.5 py-1 rounded-full border ${
+              agentOnline
+                ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                : 'bg-slate-800/60 text-slate-400 border-slate-600/40'
+            }`}
+            title={
+              agentOnline
+                ? 'Print agent online — jobs spool silently on the shop PC, no browser dialogue'
+                : 'Print agent offline — jobs print through this browser'
+            }
+          >
+            <Printer className="w-3.5 h-3.5" />
+            {agentOnline ? 'Fleet agent' : 'Browser print'}
+          </span>
+        )}
 
         {/* Demo: simulate an incoming order */}
         {!isSupabaseConfigured && (

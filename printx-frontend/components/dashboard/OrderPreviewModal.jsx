@@ -23,6 +23,7 @@ import {
   ChevronRight,
 } from 'lucide-react';
 import { supabase, isSupabaseConfigured } from '../../lib/supabaseClient';
+import { triggerSilentPrint } from '../../lib/printer';
 
 /**
  * OrderPreviewModal — full-screen dark glassmorphism overlay.
@@ -193,27 +194,18 @@ export default function OrderPreviewModal({ order, onClose, onStatusChange }) {
     if (!fileToPrint?.fileUrl || busyAction) return;
     setBusyAction('print');
     try {
-      const existing = document.getElementById('modal-print-frame');
-      if (existing) existing.remove();
-      const frame = document.createElement('iframe');
-      frame.id = 'modal-print-frame';
-      frame.style.cssText = 'position:fixed;right:0;bottom:0;width:0;height:0;border:0';
-      frame.src = fileToPrint.fileUrl;
-      frame.onload = () => {
-        try {
-          frame.contentWindow.focus();
-          frame.contentWindow.print();
-        } catch {
-          window.open(fileToPrint.fileUrl, '_blank', 'noopener');
-        }
-      };
-      document.body.appendChild(frame);
+      // Same fleet-wide hidden-frame path the queue uses (self-cleaning frame,
+      // cross-origin → new-tab fallback); a manual, vendor-initiated print.
+      const printed = triggerSilentPrint(fileToPrint.fileUrl);
 
       if (isSupabaseConfigured && supabase) {
         await supabase.from('print_jobs').update({ status: 'PRINTING' }).eq('id', order.id);
       }
       onStatusChange?.(order.id, 'PRINTING');
-      setToast({ type: 'success', message: `Printing ${order.token_number}…` });
+      setToast({
+        type: 'success',
+        message: printed ? `Printing ${order.token_number}…` : `Could not print ${order.token_number}`,
+      });
     } catch {
       window.open(fileToPrint.fileUrl, '_blank', 'noopener');
     } finally {

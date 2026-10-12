@@ -23,6 +23,7 @@ import {
 import LiveQueueTable from '../../../components/dashboard/LiveQueueTable';
 import { useRequireAuth } from '../../../lib/useRequireAuth';
 import { supabase, isSupabaseConfigured } from '../../../lib/supabaseClient';
+import { isAutoPrintEnabled, setAutoPrintEnabled, AUTO_PRINT_KEY } from '../../../lib/printer';
 
 /*
  * Perf: the walk-in / quick-cash modals and the EOD report builder are only
@@ -65,13 +66,10 @@ export default function DashboardOverview() {
   const [autoPrintHydrated, setAutoPrintHydrated] = useState(false);
 
   useEffect(() => {
-    try {
-      if (window.localStorage.getItem('printx_auto_print') === '1') {
-        setAutoPrint(true);
-      }
-    } catch {
-      /* storage unavailable (private mode) — default OFF */
-    }
+    // Shared helper (lib/printer.js) so this flag can never drift from the
+    // key/format the Live Print Queue reads. Legacy '1' values still count
+    // as ON; new writes are always 'true' | 'false'.
+    setAutoPrint(isAutoPrintEnabled());
     setAutoPrintHydrated(true);
   }, []);
 
@@ -79,12 +77,27 @@ export default function DashboardOverview() {
     // Skip the very first run so the write-back can't clobber the stored
     // value before the read effect above has applied it.
     if (!autoPrintHydrated) return;
-    try {
-      window.localStorage.setItem('printx_auto_print', autoPrint ? '1' : '0');
-    } catch {
-      /* storage unavailable — toggle still works in-session */
-    }
+    // Persists `printx_auto_print` = 'true' | 'false' and dispatches
+    // `printx:auto-print` so an open queue picks the change up instantly.
+    setAutoPrintEnabled(autoPrint);
   }, [autoPrint, autoPrintHydrated]);
+
+  useEffect(() => {
+    // Mirror the flag when it was flipped elsewhere: the same-tab
+    // `printx:auto-print` event, or the native `storage` event from another
+    // tab sharing this browser (second counter screen, owner's phone…).
+    const onFlag = (e) => setAutoPrint(!!e?.detail);
+    const onStorage = (e) => {
+      if (e?.key !== AUTO_PRINT_KEY || e.newValue == null) return;
+      setAutoPrint(e.newValue === 'true' || e.newValue === '1');
+    };
+    window.addEventListener('printx:auto-print', onFlag);
+    window.addEventListener('storage', onStorage);
+    return () => {
+      window.removeEventListener('printx:auto-print', onFlag);
+      window.removeEventListener('storage', onStorage);
+    };
+  }, []);
   const [showWalkInModal, setShowWalkInModal] = useState(false);
   const [walkInToast, setWalkInToast] = useState(null);
   /* ⚡ Quick Cash Order — offline counter sale + its confirmation toast */
